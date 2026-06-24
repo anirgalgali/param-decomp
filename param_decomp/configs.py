@@ -24,6 +24,7 @@ from param_decomp.masks import SamplingType
 from param_decomp.metrics.ci_masked_recon import CIMaskedReconLossConfig
 from param_decomp.metrics.ci_masked_recon_layerwise import CIMaskedReconLayerwiseLossConfig
 from param_decomp.metrics.ci_masked_recon_subset import CIMaskedReconSubsetLossConfig
+from param_decomp.metrics.decoder_column_mass import DecoderColumnMassLossConfig
 from param_decomp.metrics.faithfulness import FaithfulnessLossConfig
 from param_decomp.metrics.importance_minimality import ImportanceMinimalityLossConfig
 from param_decomp.metrics.persistent_pgd_recon import (
@@ -33,6 +34,7 @@ from param_decomp.metrics.persistent_pgd_recon import (
 from param_decomp.metrics.pgd_masked_recon import PGDReconLossConfig
 from param_decomp.metrics.pgd_masked_recon_layerwise import PGDReconLayerwiseLossConfig
 from param_decomp.metrics.pgd_masked_recon_subset import PGDReconSubsetLossConfig
+from param_decomp.metrics.spike_gate_kl import SpikeGateKLLossConfig
 from param_decomp.metrics.stochastic_hidden_acts_recon import StochasticHiddenActsReconLossConfig
 from param_decomp.metrics.stochastic_recon import StochasticReconLossConfig
 from param_decomp.metrics.stochastic_recon_layerwise import StochasticReconLayerwiseLossConfig
@@ -57,6 +59,7 @@ AnyLossMetricConfig = Annotated[
     CIMaskedReconLayerwiseLossConfig
     | CIMaskedReconLossConfig
     | CIMaskedReconSubsetLossConfig
+    | DecoderColumnMassLossConfig
     | FaithfulnessLossConfig
     | ImportanceMinimalityLossConfig
     | PersistentPGDReconLossConfig
@@ -64,6 +67,7 @@ AnyLossMetricConfig = Annotated[
     | PGDReconLayerwiseLossConfig
     | PGDReconLossConfig
     | PGDReconSubsetLossConfig
+    | SpikeGateKLLossConfig
     | StochasticHiddenActsReconLossConfig
     | StochasticReconLayerwiseLossConfig
     | StochasticReconLossConfig

@@ -7,7 +7,7 @@ import einops
 import torch
 import torch.nn.functional as F
 from jaxtyping import Float
-from pydantic import Field, PositiveInt, model_validator
+from pydantic import Field, NonNegativeFloat, PositiveFloat, PositiveInt, model_validator
 from torch import Tensor, nn
 
 from param_decomp.base_config import BaseConfig
@@ -114,9 +114,42 @@ class GlobalCiConfig(BaseConfig):
         return self
 
 
+class SpikeGatedCiConfig(BaseConfig):
+    """Stage-1 spike-gated probabilistic CI bottleneck (gate-only, `D=0`).
+
+    A shared encoder maps the concatenated decomposition-target inputs to `n_mechanisms`
+    gate logits; a hard-concrete gate samples `z ∈ [0,1]^K` (deterministic at eval); a
+    linear decoder `B ∈ R^{M×K}` maps `z` to per-component pre-sigmoid CI logits, split back
+    per layer. See `docs/slpd_stage1_spike_design.md` in the slpd project.
+    """
+
+    mode: Literal["spike_gated"] = "spike_gated"
+    encoder_hidden_dims: list[PositiveInt] = Field(
+        ...,
+        description="Hidden dims of the shared encoder trunk (empty list ⇒ a linear encoder).",
+    )
+    n_mechanisms: PositiveInt = Field(
+        ..., description="Number of latent mechanisms K (overcomplete vs. expected count)."
+    )
+    hard_concrete_temp: PositiveFloat = Field(
+        default=0.5, description="Binary/hard-concrete temperature τ."
+    )
+    hard_concrete_stretch: NonNegativeFloat = Field(
+        default=0.1, description="Hard-concrete stretch s; the interval is (γ,ζ)=(-s, 1+s)."
+    )
+    slab_sigma0: NonNegativeFloat = Field(
+        default=0.0,
+        description="Multiplicative slab jitter std (0 ⇒ z=γ, a clean binary gate).",
+    )
+    decoder_nonneg: bool = Field(
+        default=False,
+        description="If True, B is passed through softplus so mechanisms only turn components on.",
+    )
+
+
 # Discriminated union (by `mode`) of every CI-fn config the trainer accepts. Pydantic
 # picks the right branch from the YAML `pd.ci_config.mode` literal.
-CiConfig = LayerwiseCiConfig | GlobalCiConfig
+CiConfig = LayerwiseCiConfig | GlobalCiConfig | SpikeGatedCiConfig
 
 
 class MLPCiFn(nn.Module):
@@ -238,6 +271,83 @@ class GlobalSharedMLPCiFn(nn.Module):
         concatenated = torch.cat(inputs_list, dim=-1)
         output = self.layers(concatenated)
         split_outputs = torch.split(output, self.split_sizes, dim=-1)
+        return {name: split_outputs[i] for i, name in enumerate(self.layer_order)}
+
+
+class SpikeGatedCiFn(nn.Module):
+    """Spike-gated probabilistic CI bottleneck (Stage-1: gate-only, `D=0`).
+
+    Same dict-in/dict-out contract as `GlobalSharedMLPCiFn` so it sits behind
+    `GlobalCiFnWrapper` unchanged. A shared encoder produces `K` gate logits from the
+    concatenated layer inputs; a hard-concrete gate samples `z ∈ [0,1]^K` (the median gate
+    `sigmoid(logits)·(ζ-γ)+γ` clamped, deterministically, when not `self.training`); a linear
+    decoder `B ∈ R^{M×K}` maps `z` to per-component pre-sigmoid logits, split back per layer.
+
+    Side effects consumed by the Stage-1 losses: every forward caches the per-mechanism gate
+    probabilities `π = sigmoid(logits)` on `self._pi` (grad-attached) for `SpikeGateKLLoss`,
+    and `self.B` is read directly by `DecoderColumnMassLoss`. Both rely on the CI fn forward
+    running exactly once per training step (inside `calc_causal_importances`).
+    """
+
+    def __init__(
+        self,
+        layer_configs: dict[str, tuple[int, int]],  # layer_name -> (input_dim, C)
+        encoder_hidden_dims: list[int],
+        n_mechanisms: int,
+        hard_concrete_temp: float,
+        hard_concrete_stretch: float,
+        slab_sigma0: float,
+        decoder_nonneg: bool,
+    ):
+        super().__init__()
+        self.layer_order = sorted(layer_configs.keys())
+        self.split_sizes = [layer_configs[name][1] for name in self.layer_order]
+        total_input_dim = sum(input_dim for input_dim, _ in layer_configs.values())
+        self.M = sum(C for _, C in layer_configs.values())
+        self.K = n_mechanisms
+        self.temp = hard_concrete_temp
+        self.stretch = hard_concrete_stretch
+        self.slab_sigma0 = slab_sigma0
+        self.decoder_nonneg = decoder_nonneg
+
+        self.encoder = nn.Sequential()
+        for i in range(len(encoder_hidden_dims)):
+            in_dim = total_input_dim if i == 0 else encoder_hidden_dims[i - 1]
+            self.encoder.append(Linear(in_dim, encoder_hidden_dims[i], nonlinearity="relu"))
+            self.encoder.append(nn.GELU())
+        final_dim = encoder_hidden_dims[-1] if encoder_hidden_dims else total_input_dim
+        self.encoder.append(Linear(final_dim, n_mechanisms, nonlinearity="linear"))
+
+        self.B = nn.Parameter(torch.empty(self.M, n_mechanisms))
+        nn.init.normal_(self.B, std=0.1)
+
+        # Cached per forward for SpikeGateKLLoss; None until the first forward.
+        self._pi: Float[Tensor, "... K"] | None = None
+
+    def _sample_gate(self, logits: Float[Tensor, "... K"]) -> Float[Tensor, "... K"]:
+        """Hard-concrete gate: stochastic when training, deterministic median otherwise."""
+        gamma, zeta = -self.stretch, 1.0 + self.stretch
+        if self.training:
+            u = torch.rand_like(logits).clamp(1e-6, 1.0 - 1e-6)
+            s = torch.sigmoid((torch.log(u) - torch.log1p(-u) + logits) / self.temp)
+        else:
+            s = torch.sigmoid(logits)
+        return (s * (zeta - gamma) + gamma).clamp(0.0, 1.0)
+
+    @override
+    def forward(
+        self,
+        input_acts: dict[str, Float[Tensor, "... d_in"]],
+    ) -> dict[str, Float[Tensor, "... C"]]:
+        concatenated = torch.cat([input_acts[name] for name in self.layer_order], dim=-1)
+        logits = self.encoder(concatenated)
+        self._pi = torch.sigmoid(logits)
+        gate = self._sample_gate(logits)
+        if self.slab_sigma0 > 0.0:
+            gate = gate * (1.0 + self.slab_sigma0 * torch.randn_like(gate))
+        b_eff = F.softplus(self.B) if self.decoder_nonneg else self.B
+        pre_sigmoid = einops.einsum(gate, b_eff, "... K, M K -> ... M")
+        split_outputs = torch.split(pre_sigmoid, self.split_sizes, dim=-1)
         return {name: split_outputs[i] for i, name in enumerate(self.layer_order)}
 
 
@@ -391,7 +501,7 @@ class GlobalCiFnWrapper(nn.Module):
 
     def __init__(
         self,
-        global_ci_fn: GlobalSharedMLPCiFn | GlobalSharedTransformerCiFn,
+        global_ci_fn: GlobalSharedMLPCiFn | GlobalSharedTransformerCiFn | SpikeGatedCiFn,
         components: dict[str, Components],
     ):
         super().__init__()
@@ -477,6 +587,45 @@ def _make_global_ci_fn(
             )
 
 
+def _make_spike_gated_ci_fn(
+    target_model: nn.Module,
+    module_to_c: dict[str, int],
+    components: dict[str, Components],
+    ci_config: SpikeGatedCiConfig,
+) -> SpikeGatedCiFn:
+    layer_configs: dict[str, tuple[int, int]] = {}
+    for path, module_c in module_to_c.items():
+        target_module = target_model.get_submodule(path)
+        component = components[path]
+        if isinstance(target_module, nn.Embedding):
+            assert isinstance(component, EmbeddingComponents)
+            input_dim = component.C
+        else:
+            input_dim = get_module_input_dim(target_module)
+        layer_configs[path] = (input_dim, module_c)
+    return SpikeGatedCiFn(
+        layer_configs=layer_configs,
+        encoder_hidden_dims=ci_config.encoder_hidden_dims,
+        n_mechanisms=ci_config.n_mechanisms,
+        hard_concrete_temp=ci_config.hard_concrete_temp,
+        hard_concrete_stretch=ci_config.hard_concrete_stretch,
+        slab_sigma0=ci_config.slab_sigma0,
+        decoder_nonneg=ci_config.decoder_nonneg,
+    )
+
+
+def get_spike_gated_ci_fn(ci_fn: nn.Module) -> SpikeGatedCiFn:
+    """Return the inner `SpikeGatedCiFn` from a `GlobalCiFnWrapper` (asserts the type).
+
+    Used by the Stage-1 losses to reach the cached gate probabilities / decoder weights.
+    """
+    inner = getattr(ci_fn, "_global_ci_fn", None)
+    assert isinstance(inner, SpikeGatedCiFn), (
+        "expected a spike-gated CI fn (set ci_config.mode='spike_gated')"
+    )
+    return inner
+
+
 def make_ci_fn_wrapper(
     target_model: nn.Module,
     module_to_c: dict[str, int],
@@ -521,3 +670,11 @@ def make_ci_fn_wrapper(
                 ci_config=ci_config,
             )
             return GlobalCiFnWrapper(global_ci_fn=raw_global, components=components)
+        case SpikeGatedCiConfig():
+            raw_spike = _make_spike_gated_ci_fn(
+                target_model=target_model,
+                module_to_c=module_to_c,
+                components=components,
+                ci_config=ci_config,
+            )
+            return GlobalCiFnWrapper(global_ci_fn=raw_spike, components=components)

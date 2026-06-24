@@ -11,6 +11,7 @@ from param_decomp.metrics.base import Metric
 from param_decomp.metrics.ci_masked_recon import CIMaskedReconLoss
 from param_decomp.metrics.ci_masked_recon_layerwise import CIMaskedReconLayerwiseLoss
 from param_decomp.metrics.ci_masked_recon_subset import CIMaskedReconSubsetLoss
+from param_decomp.metrics.decoder_column_mass import DecoderColumnMassLoss
 from param_decomp.metrics.faithfulness import FaithfulnessLoss
 from param_decomp.metrics.importance_minimality import ImportanceMinimalityLoss
 from param_decomp.metrics.persistent_pgd_recon import (
@@ -21,6 +22,7 @@ from param_decomp.metrics.pgd_masked_recon import PGDReconLoss
 from param_decomp.metrics.pgd_masked_recon_layerwise import PGDReconLayerwiseLoss
 from param_decomp.metrics.pgd_masked_recon_subset import PGDReconSubsetLoss
 from param_decomp.metrics.stochastic_hidden_acts_recon import StochasticHiddenActsReconLoss
+from param_decomp.metrics.spike_gate_kl import SpikeGateKLLoss
 from param_decomp.metrics.stochastic_recon import StochasticReconLoss
 from param_decomp.metrics.stochastic_recon_layerwise import StochasticReconLayerwiseLoss
 from param_decomp.metrics.stochastic_recon_subset import StochasticReconSubsetLoss
@@ -32,6 +34,7 @@ LOSS_METRIC_CLASSES: dict[str, type[Metric[Any]]] = {
         CIMaskedReconLayerwiseLoss,
         CIMaskedReconLoss,
         CIMaskedReconSubsetLoss,
+        DecoderColumnMassLoss,
         FaithfulnessLoss,
         ImportanceMinimalityLoss,
         PersistentPGDReconLoss,
@@ -39,6 +42,7 @@ LOSS_METRIC_CLASSES: dict[str, type[Metric[Any]]] = {
         PGDReconLayerwiseLoss,
         PGDReconLoss,
         PGDReconSubsetLoss,
+        SpikeGateKLLoss,
         StochasticHiddenActsReconLoss,
         StochasticReconLayerwiseLoss,
         StochasticReconLoss,
