@@ -12,6 +12,9 @@ def _make_fn(**kw) -> SpikeGatedCiFn:
         n_mechanisms=8,
         gate_type="hard_concrete",
         hard_concrete_temp=0.5,
+        hard_concrete_temp_final=None,
+        temp_anneal_start_frac=0.0,
+        temp_anneal_end_frac=1.0,
         hard_concrete_stretch=0.1,
         slab_sigma0=0.0,
         decoder_nonneg=False,
@@ -113,6 +116,44 @@ def test_deterministic_grad_reaches_encoder_and_decoder():
     loss.backward()
     assert fn.B.grad is not None and fn.B.grad.abs().sum() > 0
     assert fn.encoder[0].W.grad is not None and fn.encoder[0].W.grad.abs().sum() > 0
+
+
+def test_anneal_temperature_noop_when_final_is_none():
+    fn = _make_fn(hard_concrete_temp=0.5, hard_concrete_temp_final=None)
+    fn.anneal_temperature(0.0)
+    assert fn.temp == 0.5
+    fn.anneal_temperature(1.0)
+    assert fn.temp == 0.5
+
+
+def test_anneal_temperature_linear_interpolation():
+    fn = _make_fn(
+        hard_concrete_temp=1.0,
+        hard_concrete_temp_final=0.2,
+        temp_anneal_start_frac=0.0,
+        temp_anneal_end_frac=1.0,
+    )
+    fn.anneal_temperature(0.0)
+    assert fn.temp == pytest.approx(1.0)
+    fn.anneal_temperature(0.5)
+    assert fn.temp == pytest.approx(0.6)  # halfway between 1.0 and 0.2
+    fn.anneal_temperature(1.0)
+    assert fn.temp == pytest.approx(0.2)
+
+
+def test_anneal_temperature_respects_window():
+    fn = _make_fn(
+        hard_concrete_temp=1.0,
+        hard_concrete_temp_final=0.2,
+        temp_anneal_start_frac=0.25,
+        temp_anneal_end_frac=0.75,
+    )
+    fn.anneal_temperature(0.1)  # before window: still start
+    assert fn.temp == pytest.approx(1.0)
+    fn.anneal_temperature(0.5)  # midpoint of [0.25, 0.75]
+    assert fn.temp == pytest.approx(0.6)
+    fn.anneal_temperature(0.9)  # after window: clamped to final
+    assert fn.temp == pytest.approx(0.2)
 
 
 def test_get_spike_gated_ci_fn_accessor():

@@ -10,7 +10,7 @@ from jaxtyping import Float
 from pydantic import Field, NonNegativeFloat, PositiveFloat, PositiveInt, model_validator
 from torch import Tensor, nn
 
-from param_decomp.base_config import BaseConfig
+from param_decomp.base_config import BaseConfig, Probability
 from param_decomp.ci_nn_blocks import Linear, ParallelLinear, TransformerBlock
 from param_decomp.components import Components, EmbeddingComponents, get_module_input_dim
 
@@ -138,7 +138,18 @@ class SpikeGatedCiConfig(BaseConfig):
         description="`hard_concrete` = stochastic spike; `deterministic` = z=sigmoid(logits).",
     )
     hard_concrete_temp: PositiveFloat = Field(
-        default=0.5, description="Binary/hard-concrete temperature τ."
+        default=0.5, description="Binary/hard-concrete temperature τ (the start value when annealing)."
+    )
+    hard_concrete_temp_final: PositiveFloat | None = Field(
+        default=None,
+        description="Final τ for linear annealing from `hard_concrete_temp`; None ⇒ constant τ. "
+        "Lower τ sharpens the gate toward {0,1}; anneal from soft (low-variance) to sharp.",
+    )
+    temp_anneal_start_frac: Probability = Field(
+        default=0.0, description="Fraction of training at which τ annealing begins."
+    )
+    temp_anneal_end_frac: Probability = Field(
+        default=1.0, description="Fraction of training at which τ reaches `hard_concrete_temp_final`."
     )
     hard_concrete_stretch: NonNegativeFloat = Field(
         default=0.1, description="Hard-concrete stretch s; the interval is (γ,ζ)=(-s, 1+s)."
@@ -303,6 +314,9 @@ class SpikeGatedCiFn(nn.Module):
         n_mechanisms: int,
         gate_type: str,
         hard_concrete_temp: float,
+        hard_concrete_temp_final: float | None,
+        temp_anneal_start_frac: float,
+        temp_anneal_end_frac: float,
         hard_concrete_stretch: float,
         slab_sigma0: float,
         decoder_nonneg: bool,
@@ -314,7 +328,12 @@ class SpikeGatedCiFn(nn.Module):
         self.M = sum(C for _, C in layer_configs.values())
         self.K = n_mechanisms
         self.gate_type = gate_type
+        # `temp` is mutated per-step by `anneal_temperature`; `_temp_start` is the fixed start.
         self.temp = hard_concrete_temp
+        self._temp_start = hard_concrete_temp
+        self._temp_final = hard_concrete_temp_final
+        self._temp_anneal_start_frac = temp_anneal_start_frac
+        self._temp_anneal_end_frac = temp_anneal_end_frac
         self.stretch = hard_concrete_stretch
         self.slab_sigma0 = slab_sigma0
         self.decoder_nonneg = decoder_nonneg
@@ -332,6 +351,22 @@ class SpikeGatedCiFn(nn.Module):
 
         # Cached per forward for SpikeGateKLLoss; None until the first forward.
         self._pi: Float[Tensor, "... K"] | None = None
+
+    def anneal_temperature(self, current_frac: float) -> None:
+        """Set `self.temp` by linearly annealing `_temp_start → _temp_final` over the configured
+        fraction window. No-op when `_temp_final is None`. Called once per training step by the
+        trainer (mirrors the importance-minimality p-anneal); recomputed from scratch so it is
+        resume-safe. Only the stochastic (training) hard-concrete branch reads `self.temp`."""
+        if self._temp_final is None:
+            return
+        start, end = self._temp_anneal_start_frac, self._temp_anneal_end_frac
+        if current_frac <= start:
+            self.temp = self._temp_start
+        elif current_frac >= end:
+            self.temp = self._temp_final
+        else:
+            progress = (current_frac - start) / (end - start)
+            self.temp = self._temp_start + (self._temp_final - self._temp_start) * progress
 
     def _sample_gate(self, logits: Float[Tensor, "... K"]) -> Float[Tensor, "... K"]:
         """Hard-concrete gate (stochastic train / median eval), or deterministic z=sigmoid(logits)."""
@@ -620,6 +655,9 @@ def _make_spike_gated_ci_fn(
         n_mechanisms=ci_config.n_mechanisms,
         gate_type=ci_config.gate_type,
         hard_concrete_temp=ci_config.hard_concrete_temp,
+        hard_concrete_temp_final=ci_config.hard_concrete_temp_final,
+        temp_anneal_start_frac=ci_config.temp_anneal_start_frac,
+        temp_anneal_end_frac=ci_config.temp_anneal_end_frac,
         hard_concrete_stretch=ci_config.hard_concrete_stretch,
         slab_sigma0=ci_config.slab_sigma0,
         decoder_nonneg=ci_config.decoder_nonneg,

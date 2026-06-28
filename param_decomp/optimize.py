@@ -542,6 +542,16 @@ class Trainer:
             for group in self.ci_fn_optimizer.param_groups:
                 group["lr"] = ci_fn_lr
 
+            # Broadcast the training fraction to any module that anneals an internal schedule
+            # (e.g. the spike gate's hard-concrete temperature). No-op for modules without it.
+            current_frac = step / pd_config.steps if pd_config.steps > 0 else 1.0
+            gate_temp: float | None = None
+            for module in self.component_model.modules():
+                anneal = getattr(module, "anneal_temperature", None)
+                if callable(anneal):
+                    anneal(current_frac)
+                    gate_temp = getattr(module, "temp", None)
+
             batch_log_data: defaultdict[str, float] = defaultdict(float)
 
             # Compute weight_deltas OUTSIDE bf16_autocast so FaithfulnessLoss residuals are fp32
@@ -603,6 +613,8 @@ class Trainer:
                 batch_log_data.update(grad_norm_log_data)
                 batch_log_data["schedules/lr/components"] = components_lr
                 batch_log_data["schedules/lr/ci_fn"] = ci_fn_lr
+                if gate_temp is not None:
+                    batch_log_data["schedules/gate_temp"] = gate_temp
 
                 sink.console(
                     f"--- Step {step} ---",
