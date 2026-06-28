@@ -10,6 +10,7 @@ def _make_fn(**kw) -> SpikeGatedCiFn:
         layer_configs={"linear1": (15, 20), "linear2": (8, 20)},
         encoder_hidden_dims=[16],
         n_mechanisms=8,
+        gate_type="hard_concrete",
         hard_concrete_temp=0.5,
         hard_concrete_stretch=0.1,
         slab_sigma0=0.0,
@@ -78,6 +79,40 @@ def test_empty_encoder_hidden_dims_is_linear():
     fn = _make_fn(encoder_hidden_dims=[])
     out = fn(_acts())
     assert out["linear1"].shape == (4, 20)
+
+
+def test_deterministic_gate_train_equals_eval():
+    fn = _make_fn(gate_type="deterministic")
+    acts = _acts()
+    fn.train()
+    train_out = fn(acts)["linear1"]
+    fn.eval()
+    eval_out = fn(acts)["linear1"]
+    assert torch.allclose(train_out, eval_out)
+
+
+def test_deterministic_gate_uses_pi():
+    fn = _make_fn(gate_type="deterministic")
+    out = fn(_acts())
+    expected = fn._pi @ fn.B.t()  # gate == π, signed decoder
+    got = torch.cat([out["linear1"], out["linear2"]], dim=-1)
+    assert torch.allclose(got, expected, atol=1e-6)
+
+
+def test_deterministic_nonneg_pre_sigmoid_is_nonnegative():
+    fn = _make_fn(gate_type="deterministic", decoder_nonneg=True)
+    out = fn(_acts())
+    assert bool((out["linear1"] >= 0).all()) and bool((out["linear2"] >= 0).all())
+
+
+def test_deterministic_grad_reaches_encoder_and_decoder():
+    fn = _make_fn(gate_type="deterministic")
+    fn.train()
+    out = fn(_acts())
+    loss = sum(v.pow(2).mean() for v in out.values())
+    loss.backward()
+    assert fn.B.grad is not None and fn.B.grad.abs().sum() > 0
+    assert fn.encoder[0].W.grad is not None and fn.encoder[0].W.grad.abs().sum() > 0
 
 
 def test_get_spike_gated_ci_fn_accessor():

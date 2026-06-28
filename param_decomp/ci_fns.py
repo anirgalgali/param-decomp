@@ -118,9 +118,11 @@ class SpikeGatedCiConfig(BaseConfig):
     """Stage-1 spike-gated probabilistic CI bottleneck (gate-only, `D=0`).
 
     A shared encoder maps the concatenated decomposition-target inputs to `n_mechanisms`
-    gate logits; a hard-concrete gate samples `z ∈ [0,1]^K` (deterministic at eval); a
-    linear decoder `B ∈ R^{M×K}` maps `z` to per-component pre-sigmoid CI logits, split back
-    per layer. See `docs/slpd_stage1_spike_design.md` in the slpd project.
+    gate logits; the gate maps logits to `z ∈ [0,1]^K`; a linear decoder `B ∈ R^{M×K}` maps
+    `z` to per-component pre-sigmoid CI logits, split back per layer. Two gate types:
+    `hard_concrete` (stochastic spike, deterministic at eval; `docs/slpd_stage1_spike_design.md`)
+    and `deterministic` (`z = sigmoid(logits) = π`, identical in train/eval, the minimal
+    first-pass gate; `docs/slpd_stage1_minimal_ci.md`).
     """
 
     mode: Literal["spike_gated"] = "spike_gated"
@@ -130,6 +132,10 @@ class SpikeGatedCiConfig(BaseConfig):
     )
     n_mechanisms: PositiveInt = Field(
         ..., description="Number of latent mechanisms K (overcomplete vs. expected count)."
+    )
+    gate_type: Literal["hard_concrete", "deterministic"] = Field(
+        default="hard_concrete",
+        description="`hard_concrete` = stochastic spike; `deterministic` = z=sigmoid(logits).",
     )
     hard_concrete_temp: PositiveFloat = Field(
         default=0.5, description="Binary/hard-concrete temperature τ."
@@ -279,9 +285,10 @@ class SpikeGatedCiFn(nn.Module):
 
     Same dict-in/dict-out contract as `GlobalSharedMLPCiFn` so it sits behind
     `GlobalCiFnWrapper` unchanged. A shared encoder produces `K` gate logits from the
-    concatenated layer inputs; a hard-concrete gate samples `z ∈ [0,1]^K` (the median gate
-    `sigmoid(logits)·(ζ-γ)+γ` clamped, deterministically, when not `self.training`); a linear
-    decoder `B ∈ R^{M×K}` maps `z` to per-component pre-sigmoid logits, split back per layer.
+    concatenated layer inputs; the gate maps logits to `z ∈ [0,1]^K` — either `hard_concrete`
+    (stochastic spike when training, the median gate `sigmoid(logits)·(ζ-γ)+γ` clamped at eval)
+    or `deterministic` (`z = sigmoid(logits) = π`, train/eval identical); a linear decoder
+    `B ∈ R^{M×K}` maps `z` to per-component pre-sigmoid logits, split back per layer.
 
     Side effects consumed by the Stage-1 losses: every forward caches the per-mechanism gate
     probabilities `π = sigmoid(logits)` on `self._pi` (grad-attached) for `SpikeGateKLLoss`,
@@ -294,6 +301,7 @@ class SpikeGatedCiFn(nn.Module):
         layer_configs: dict[str, tuple[int, int]],  # layer_name -> (input_dim, C)
         encoder_hidden_dims: list[int],
         n_mechanisms: int,
+        gate_type: str,
         hard_concrete_temp: float,
         hard_concrete_stretch: float,
         slab_sigma0: float,
@@ -305,6 +313,7 @@ class SpikeGatedCiFn(nn.Module):
         total_input_dim = sum(input_dim for input_dim, _ in layer_configs.values())
         self.M = sum(C for _, C in layer_configs.values())
         self.K = n_mechanisms
+        self.gate_type = gate_type
         self.temp = hard_concrete_temp
         self.stretch = hard_concrete_stretch
         self.slab_sigma0 = slab_sigma0
@@ -325,7 +334,9 @@ class SpikeGatedCiFn(nn.Module):
         self._pi: Float[Tensor, "... K"] | None = None
 
     def _sample_gate(self, logits: Float[Tensor, "... K"]) -> Float[Tensor, "... K"]:
-        """Hard-concrete gate: stochastic when training, deterministic median otherwise."""
+        """Hard-concrete gate (stochastic train / median eval), or deterministic z=sigmoid(logits)."""
+        if self.gate_type == "deterministic":
+            return torch.sigmoid(logits)
         gamma, zeta = -self.stretch, 1.0 + self.stretch
         if self.training:
             u = torch.rand_like(logits).clamp(1e-6, 1.0 - 1e-6)
@@ -607,6 +618,7 @@ def _make_spike_gated_ci_fn(
         layer_configs=layer_configs,
         encoder_hidden_dims=ci_config.encoder_hidden_dims,
         n_mechanisms=ci_config.n_mechanisms,
+        gate_type=ci_config.gate_type,
         hard_concrete_temp=ci_config.hard_concrete_temp,
         hard_concrete_stretch=ci_config.hard_concrete_stretch,
         slab_sigma0=ci_config.slab_sigma0,
