@@ -8,9 +8,12 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from param_decomp.ci_fns import SpikeGatedCiConfig
 from param_decomp.component_model import CIOutputs, ComponentModel
+from param_decomp.decomposition_targets import DecompositionTarget
 from param_decomp.masks import make_mask_infos
 from param_decomp.metrics.ci_masked_recon import ci_masked_recon_loss
+from param_decomp.metrics.context import MetricContext
 from param_decomp.metrics.persistent_pgd_recon import (
     PersistentPGDReconLoss,
     PersistentPGDReconLossConfig,
@@ -21,7 +24,7 @@ from param_decomp.metrics.persistent_pgd_state import (
     SingleSourceScope,
     get_ppgd_mask_infos,
 )
-from param_decomp.metrics.pgd_masked_recon import pgd_recon_loss
+from param_decomp.metrics.pgd_masked_recon import PGDReconLoss, PGDReconLossConfig, pgd_recon_loss
 from param_decomp.metrics.pgd_utils import PGDConfig
 from param_decomp.metrics.stochastic_hidden_acts_recon import (
     _sum_per_module_mse,
@@ -35,7 +38,7 @@ from param_decomp.tests.metrics.fixtures import (
     make_one_layer_component_model,
     make_two_layer_component_model,
 )
-from param_decomp_lab.batch_and_loss_fns import recon_loss_mse
+from param_decomp_lab.batch_and_loss_fns import recon_loss_mse, run_batch_passthrough
 from param_decomp_lab.eval_metrics.ci_hidden_acts_recon_loss import (
     CIHiddenActsReconLoss,
     CIHiddenActsReconLossConfig,
@@ -233,6 +236,7 @@ def test_per_module_recon_metric_keys() -> None:
         target_out=target_output.output,
         pre_weight_acts=target_output.cache,
         ci=ci,
+        ci_adversarial=ci,
         weight_deltas={},
         step=0,
         total_steps=1,
@@ -290,6 +294,7 @@ def test_ppgd_recon_eval_metric_keys() -> None:
         target_out=target_out,
         pre_weight_acts={},
         ci=_make_ci_outputs(ci),
+        ci_adversarial=_make_ci_outputs(ci),
         weight_deltas={},
         step=0,
         total_steps=100,
@@ -370,3 +375,88 @@ def test_ppgd_recon_eval_manual_calculation() -> None:
     assert torch.allclose(fc1_mse, expected_fc1_mse, rtol=1e-5)
     fc2_mse, _ = per_module["fc2"]
     assert torch.allclose(fc2_mse, expected_fc2_mse, rtol=1e-5)
+
+
+def _make_spike_component_model() -> ComponentModel:
+    torch.manual_seed(0)
+    target = TwoLayerLinearModel(d_in=4, d_hidden=3, d_out=4)
+    target.requires_grad_(False)
+    return ComponentModel(
+        target_model=target,
+        run_batch=run_batch_passthrough,
+        decomposition_targets=[
+            DecompositionTarget(module_path="fc1", C=2),
+            DecompositionTarget(module_path="fc2", C=2),
+        ],
+        ci_config=SpikeGatedCiConfig(mode="spike_gated", encoder_hidden_dims=[4], n_mechanisms=4),
+        sigmoid_type="leaky_hard",
+    )
+
+
+def test_gate_deterministic_ci_matches_eval_and_is_stable() -> None:
+    """`calc_causal_importances(gate_deterministic=True)` in train mode reproduces the eval gate
+    and is repeat-stable, while the sampled CI is not."""
+    model = _make_spike_component_model()
+    batch = torch.randn(5, 4)
+    cache = model(batch, cache_type="input").cache
+
+    model.train()
+    torch.manual_seed(1)
+    det = model.calc_causal_importances(cache, sampling="continuous", gate_deterministic=True)
+    torch.manual_seed(2)
+    det2 = model.calc_causal_importances(cache, sampling="continuous", gate_deterministic=True)
+    model.eval()
+    eval_ci = model.calc_causal_importances(cache, sampling="continuous")
+
+    for key in det.lower_leaky:
+        assert torch.allclose(det.lower_leaky[key], det2.lower_leaky[key])  # noise-free
+        assert torch.allclose(det.lower_leaky[key], eval_ci.lower_leaky[key])  # == eval gate
+
+    model.train()
+    torch.manual_seed(1)
+    stoch = model.calc_causal_importances(cache, sampling="continuous")
+    torch.manual_seed(2)
+    stoch2 = model.calc_causal_importances(cache, sampling="continuous")
+    assert any(
+        not torch.allclose(stoch.lower_leaky[k], stoch2.lower_leaky[k]) for k in stoch.lower_leaky
+    )
+
+
+def test_pgd_recon_use_deterministic_gate_selects_ci_adversarial() -> None:
+    """With `use_deterministic_gate=True` the PGD metric attacks `ctx.ci_adversarial`, not `ctx.ci`."""
+    model = make_two_layer_component_model(weight1=torch.randn(3, 2), weight2=torch.randn(2, 3))
+    batch = torch.randn(4, 2)
+    target_out = model.target_model(batch)
+
+    ci_full = {"fc1": torch.ones(4, 1), "fc2": torch.ones(4, 1)}  # m=1: no ablation freedom
+    ci_zero = {"fc1": torch.zeros(4, 1), "fc2": torch.zeros(4, 1)}  # m∈[0,1]: adversary can ablate
+
+    pgd_kwargs = dict(
+        coeff=1.0, init="random", step_size=0.1, n_steps=5, mask_scope="unique_per_datapoint"
+    )
+
+    def run(use_det: bool) -> float:
+        metric = PGDReconLoss(PGDReconLossConfig(use_deterministic_gate=use_det, **pgd_kwargs))
+        metric.bind(model=model, device="cpu")
+        ctx = MetricContext(
+            model=model,
+            batch=batch,
+            target_out=target_out,
+            pre_weight_acts={},
+            ci=_make_ci_outputs(ci_full),
+            ci_adversarial=_make_ci_outputs(ci_zero),
+            weight_deltas={},
+            step=0,
+            total_steps=1,
+            use_delta_component=False,
+            sampling="continuous",
+            n_mask_samples=1,
+            reconstruction_loss=recon_loss_mse,
+            is_eval=False,
+        )
+        torch.manual_seed(0)
+        return metric.update(ctx).item()
+
+    # Attacking the (zero-CI) adversarial gate gives the adversary ablation freedom, so a strictly
+    # larger worst-case recon than the (all-on) sampled gate where the mask is pinned to 1.
+    assert run(use_det=True) > run(use_det=False)

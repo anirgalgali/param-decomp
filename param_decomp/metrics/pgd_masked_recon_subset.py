@@ -43,10 +43,11 @@ class PGDReconSubsetLoss(Metric[PGDReconSubsetLossConfig]):
     @override
     def update(self, ctx: MetricContext) -> Tensor:
         wd = ctx.weight_deltas if ctx.use_delta_component else None
+        ci_src = ctx.ci_adversarial if self.cfg.use_deterministic_gate else ctx.ci
         sum_loss, n = pgd_masked_recon_loss_update(
             model=self.model,
             batch=ctx.batch,
-            ci=ctx.ci.lower_leaky,
+            ci=ci_src.lower_leaky,
             weight_deltas=wd,
             target_out=ctx.target_out,
             router=self.router,

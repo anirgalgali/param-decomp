@@ -1,5 +1,7 @@
 """Causal-importance function configs, CI-fn modules, and wrappers."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Literal, Self, override
 
@@ -357,6 +359,21 @@ class SpikeGatedCiFn(nn.Module):
         # Cached per forward for SpikeGateKLLoss; None until the first forward.
         self._pi: Float[Tensor, "... K"] | None = None
 
+        # When true, the hard-concrete gate uses its noise-off (median) branch even in
+        # training mode. Set transiently via `force_deterministic_gate` so the adversarial
+        # recon term attacks the deterministic gate `z̄` (the deployed network).
+        self._force_deterministic_gate: bool = False
+
+    @contextmanager
+    def force_deterministic_gate(self) -> Iterator[None]:
+        """Force the noise-off (median) gate for the duration of the block."""
+        prev = self._force_deterministic_gate
+        self._force_deterministic_gate = True
+        try:
+            yield
+        finally:
+            self._force_deterministic_gate = prev
+
     def anneal_temperature(self, current_frac: float) -> None:
         """Set `self.temp` by linearly annealing `_temp_start → _temp_final` over the configured
         fraction window. No-op when `_temp_final is None`. Called once per training step by the
@@ -387,7 +404,7 @@ class SpikeGatedCiFn(nn.Module):
         if self.gate_type == "deterministic":
             return torch.sigmoid(logits)
         gamma, zeta = -self.stretch, 1.0 + self.stretch
-        if self.training:
+        if self.training and not self._force_deterministic_gate:
             u = torch.rand_like(logits).clamp(1e-6, 1.0 - 1e-6)
             s = torch.sigmoid((torch.log(u) - torch.log1p(-u) + logits) / self.temp)
         else:
@@ -690,6 +707,26 @@ def get_spike_gated_ci_fn(ci_fn: nn.Module) -> SpikeGatedCiFn:
         "expected a spike-gated CI fn (set ci_config.mode='spike_gated')"
     )
     return inner
+
+
+def _maybe_spike_gated_ci_fn(ci_fn: nn.Module) -> "SpikeGatedCiFn | None":
+    """The inner `SpikeGatedCiFn` if `ci_fn` wraps one, else None (non-asserting)."""
+    inner = getattr(ci_fn, "_global_ci_fn", None)
+    return inner if isinstance(inner, SpikeGatedCiFn) else None
+
+
+@contextmanager
+def maybe_force_deterministic_gate(ci_fn: nn.Module, enabled: bool) -> Iterator[None]:
+    """Force the spike gate's deterministic branch when `enabled` and `ci_fn` is spike-gated.
+
+    No-op for non-gated CI fns (already deterministic) or when `enabled` is False.
+    """
+    spike_fn = _maybe_spike_gated_ci_fn(ci_fn) if enabled else None
+    if spike_fn is None:
+        yield
+    else:
+        with spike_fn.force_deterministic_gate():
+            yield
 
 
 def make_ci_fn_wrapper(

@@ -141,22 +141,36 @@ def _build_metric_context(
     config: PDConfig,
     reconstruction_loss: ReconstructionLoss,
     weight_deltas: dict[str, Tensor],
+    needs_adversarial_ci: bool,
 ) -> MetricContext:
     # The wrapped_model(...) call here is what registers DDP gradient hooks for this step.
     # Required even if no metric uses the DDP wrapper directly.
     batch = move_batch_to_device(batch, device)
     target_model_output: OutputWithCache = wrapped_model(batch, cache_type="input")
+    # Deterministic-gate CI for the adversarial recon term (`z̄`), forced to `continuous` so
+    # it carries no gate noise and no binomial lower-leaky noise. Computed before the primary
+    # `ci` so `_pi` ends up reflecting the sampled forward. Aliased to `ci` when unused.
+    if needs_adversarial_ci:
+        ci_adversarial = component_model.calc_causal_importances(
+            pre_weight_acts=target_model_output.cache,
+            detach_inputs=False,
+            sampling="continuous",
+            gate_deterministic=True,
+        )
     ci = component_model.calc_causal_importances(
         pre_weight_acts=target_model_output.cache,
         detach_inputs=False,
         sampling=config.sampling,
     )
+    if not needs_adversarial_ci:
+        ci_adversarial = ci
     return MetricContext(
         model=component_model,
         batch=batch,
         target_out=target_model_output.output,
         pre_weight_acts=target_model_output.cache,
         ci=ci,
+        ci_adversarial=ci_adversarial,
         weight_deltas=weight_deltas,
         step=step,
         total_steps=config.steps,
@@ -365,6 +379,12 @@ class Trainer:
 
         self.loss_metrics, _ = instantiate_metrics(pd_config, component_model, device)
 
+        # Whether any loss wants the adversarial recon to attack the deterministic gate `z̄`;
+        # gates the extra (deterministic-gate) CI forward in `_build_metric_context`.
+        self._needs_adversarial_ci = any(
+            getattr(m.cfg, "use_deterministic_gate", False) for m in self.loss_metrics.values()
+        )
+
     # ============================ Named-param accessors for optimizer state ============================
 
     def _components_optimizer_named_params(self) -> list[tuple[str, nn.Parameter]]:
@@ -568,6 +588,7 @@ class Trainer:
                     config=pd_config,
                     reconstruction_loss=self.reconstruction_loss,
                     weight_deltas=weight_deltas,
+                    needs_adversarial_ci=self._needs_adversarial_ci,
                 )
                 _assert_ctx_invariants(ctx, device, step)
                 losses = {name: m.update(ctx) for name, m in self.loss_metrics.items()}
@@ -644,6 +665,7 @@ class Trainer:
                             config=pd_config,
                             reconstruction_loss=self.reconstruction_loss,
                             weight_deltas=eval_weight_deltas,
+                            needs_adversarial_ci=self._needs_adversarial_ci,
                         )
                         for m in active:
                             m.update(ctx)

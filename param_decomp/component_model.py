@@ -17,7 +17,7 @@ from transformers.pytorch_utils import Conv1D as RadfordConv1D
 
 from param_decomp.base_config import runtime_cast
 from param_decomp.batch_and_loss_fns import RunBatch
-from param_decomp.ci_fns import CiConfig, make_ci_fn_wrapper
+from param_decomp.ci_fns import CiConfig, make_ci_fn_wrapper, maybe_force_deterministic_gate
 from param_decomp.ci_sigmoids import SIGMOID_TYPES, SigmoidType
 from param_decomp.components import Components, make_components
 from param_decomp.decomposition_targets import DecompositionTarget, Identity
@@ -304,6 +304,7 @@ class ComponentModel(nn.Module):
         pre_weight_acts: dict[str, Float[Tensor, "... d_in"] | Int[Tensor, "... pos"]],
         sampling: SamplingType,
         detach_inputs: bool = False,
+        gate_deterministic: bool = False,
     ) -> CIOutputs:
         """CI values for every decomposition target.
 
@@ -320,11 +321,15 @@ class ComponentModel(nn.Module):
             detach_inputs: When true, gradients do not flow from CI back into
                 `pre_weight_acts`. Used by metrics that want to optimise CI without
                 perturbing the upstream graph.
+            gate_deterministic: Force the spike gate's noise-off (median) branch even in
+                training mode, so the adversarial recon term attacks the deterministic
+                gate `z̄`. No-op for non-gated CI fns.
         """
         if detach_inputs:
             pre_weight_acts = {k: v.detach() for k, v in pre_weight_acts.items()}
 
-        ci_fn_outputs = self.ci_fn(pre_weight_acts)
+        with maybe_force_deterministic_gate(self.ci_fn, gate_deterministic):
+            ci_fn_outputs = self.ci_fn(pre_weight_acts)
         return self._apply_sigmoid_to_ci_outputs(ci_fn_outputs, sampling)
 
     def _apply_sigmoid_to_ci_outputs(

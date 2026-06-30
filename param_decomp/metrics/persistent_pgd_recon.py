@@ -59,6 +59,8 @@ class _PersistentPGDBaseConfig(LossMetricConfig):
     )
     start_frac: Probability = 0.0
     n_samples: PositiveInt = 1
+    use_deterministic_gate: bool = False
+    """Attack the deterministic gate `z̄` (`ctx.ci_adversarial`) instead of the sampled gate."""
 
 
 class PersistentPGDReconLossConfig(_PersistentPGDBaseConfig):
@@ -171,13 +173,14 @@ class _PersistentPGDReconBase[
             self.state.update_lr(step=ctx.step, total_steps=ctx.total_steps)
 
         wd = ctx.weight_deltas if ctx.use_delta_component else None
+        ci_src = ctx.ci_adversarial if self.cfg.use_deterministic_gate else ctx.ci
 
         if not ctx.is_eval:
             self.state.warmup(
                 model=self.model,
                 batch=ctx.batch,
                 target_out=ctx.target_out,
-                ci=ctx.ci.lower_leaky,
+                ci=ci_src.lower_leaky,
                 weight_deltas=wd,
             )
 
@@ -185,7 +188,7 @@ class _PersistentPGDReconBase[
             model=self.model,
             batch=ctx.batch,
             target_out=ctx.target_out,
-            ci=ctx.ci.lower_leaky,
+            ci=ci_src.lower_leaky,
             weight_deltas=wd,
         )
 
@@ -204,8 +207,9 @@ class _PersistentPGDReconBase[
         assert self.state is not None
         target_acts = self.model(ctx.batch, cache_type="output").cache
         batch_dims = ctx.target_out.shape[:-1]
+        ci_src = ctx.ci_adversarial if self.cfg.use_deterministic_gate else ctx.ci
         mask_infos = get_ppgd_mask_infos(
-            ci=ctx.ci.lower_leaky,
+            ci=ci_src.lower_leaky,
             weight_deltas=weight_deltas,
             ppgd_sources=self.state.get_effective_sources(),
             routing_masks="all",

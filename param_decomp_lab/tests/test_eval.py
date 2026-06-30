@@ -20,6 +20,7 @@ def _make_ctx(batch: torch.Tensor, target_out: torch.Tensor, ci: CIOutputs) -> M
         target_out=target_out,
         pre_weight_acts={},
         ci=ci,
+        ci_adversarial=ci,
         weight_deltas={},
         step=0,
         total_steps=1,

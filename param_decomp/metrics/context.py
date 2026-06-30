@@ -19,7 +19,9 @@ class MetricContext:
     """Per-step bundle handed to every `Metric.update(ctx)`.
 
     Built once per training step (after the DDP forward + CI calc) and once per eval
-    batch.
+    batch. `ci` is from the sampled (stochastic) gate; `ci_adversarial` is from the
+    deterministic median gate `z̄` (aliased to `ci` unless a PGD metric opts in via
+    `use_deterministic_gate`).
     """
 
     model: ComponentModel
@@ -27,6 +29,7 @@ class MetricContext:
     target_out: Tensor
     pre_weight_acts: dict[str, Float[Tensor, "..."]]
     ci: CIOutputs
+    ci_adversarial: CIOutputs
     weight_deltas: dict[str, Float[Tensor, "d_out d_in"]]
     step: int
     total_steps: int

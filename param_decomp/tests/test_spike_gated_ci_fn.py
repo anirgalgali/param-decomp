@@ -94,6 +94,38 @@ def test_deterministic_gate_train_equals_eval():
     assert torch.allclose(train_out, eval_out)
 
 
+def test_force_deterministic_gate_in_train_matches_eval():
+    """Hard-concrete gate forced deterministic during training reproduces the eval (median) gate."""
+    fn = _make_fn(gate_type="hard_concrete")
+    acts = _acts()
+    fn.eval()
+    eval_out = fn(acts)["linear1"]
+    fn.train()
+    with fn.force_deterministic_gate():
+        forced_out = fn(acts)["linear1"]
+    assert torch.allclose(forced_out, eval_out)
+
+
+def test_force_deterministic_gate_is_noise_free_and_restores():
+    """Forced-deterministic train calls are repeat-stable; the flag is restored on exit."""
+    fn = _make_fn(gate_type="hard_concrete")
+    acts = _acts()
+    fn.train()
+    with fn.force_deterministic_gate():
+        torch.manual_seed(1)
+        a = fn(acts)["linear1"]
+        torch.manual_seed(2)
+        b = fn(acts)["linear1"]
+    assert torch.allclose(a, b)
+    assert fn._force_deterministic_gate is False
+    # stochastic gate resumes after the block
+    torch.manual_seed(1)
+    c = fn(acts)["linear1"]
+    torch.manual_seed(2)
+    d = fn(acts)["linear1"]
+    assert not torch.allclose(c, d)
+
+
 def test_deterministic_gate_uses_pi():
     fn = _make_fn(gate_type="deterministic")
     out = fn(_acts())

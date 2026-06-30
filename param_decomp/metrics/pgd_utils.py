@@ -30,6 +30,8 @@ class PGDConfig(LossMetricConfig):
     step_size: float
     n_steps: int
     mask_scope: MaskScope
+    use_deterministic_gate: bool = False
+    """Attack the deterministic gate `z̄` (`ctx.ci_adversarial`) instead of the sampled gate."""
 
 
 def get_pgd_init_tensor(
