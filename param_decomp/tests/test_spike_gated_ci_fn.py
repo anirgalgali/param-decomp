@@ -108,6 +108,40 @@ def test_deterministic_nonneg_pre_sigmoid_is_nonnegative():
     assert bool((out["linear1"] >= 0).all()) and bool((out["linear2"] >= 0).all())
 
 
+def test_nonneg_init_is_nonnegative():
+    fn = _make_fn(decoder_nonneg=True)
+    assert bool((fn.B >= 0).all())
+
+
+def test_project_nonneg_clamps_when_nonneg():
+    fn = _make_fn(decoder_nonneg=True)
+    with torch.no_grad():
+        fn.B[0, 0] = -3.0
+        fn.B[1, 1] = 0.5
+    fn.project_nonneg()
+    b = fn.B.detach()
+    assert float(b[0, 0]) == 0.0  # negative -> exactly 0 (a true off-state)
+    assert float(b[1, 1]) == 0.5  # positive untouched
+    assert bool((b >= 0).all())
+
+
+def test_project_nonneg_is_noop_when_signed():
+    fn = _make_fn(decoder_nonneg=False)
+    with torch.no_grad():
+        fn.B[0, 0] = -3.0
+    fn.project_nonneg()
+    assert float(fn.B.detach()[0, 0]) == -3.0  # signed decoder is left alone
+
+
+def test_forward_uses_raw_B_no_softplus():
+    # With the projection scheme the forward must read B directly (no softplus floor at ~0.69).
+    fn = _make_fn(gate_type="deterministic", decoder_nonneg=True)
+    out = fn(_acts())
+    expected = fn._pi @ fn.B.t()
+    got = torch.cat([out["linear1"], out["linear2"]], dim=-1)
+    assert torch.allclose(got, expected, atol=1e-6)
+
+
 def test_deterministic_grad_reaches_encoder_and_decoder():
     fn = _make_fn(gate_type="deterministic")
     fn.train()

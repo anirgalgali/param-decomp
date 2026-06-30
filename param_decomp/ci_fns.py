@@ -160,7 +160,8 @@ class SpikeGatedCiConfig(BaseConfig):
     )
     decoder_nonneg: bool = Field(
         default=False,
-        description="If True, B is passed through softplus so mechanisms only turn components on.",
+        description="If True, B is projected to ≥0 after each optimizer step (projected gradient) "
+        "so mechanisms only turn components on and off-wirings reach exactly 0.",
     )
 
 
@@ -348,6 +349,10 @@ class SpikeGatedCiFn(nn.Module):
 
         self.B = nn.Parameter(torch.empty(self.M, n_mechanisms))
         nn.init.normal_(self.B, std=0.1)
+        if self.decoder_nonneg:
+            # Start every wiring positive ("on"); the penalty + recon prune toward 0 under the
+            # per-step projection (`project_nonneg`). Same magnitude as the signed init.
+            self.B.data.abs_()
 
         # Cached per forward for SpikeGateKLLoss; None until the first forward.
         self._pi: Float[Tensor, "... K"] | None = None
@@ -367,6 +372,15 @@ class SpikeGatedCiFn(nn.Module):
         else:
             progress = (current_frac - start) / (end - start)
             self.temp = self._temp_start + (self._temp_final - self._temp_start) * progress
+
+    def project_nonneg(self) -> None:
+        """Clamp the decoder `B` to ≥0 in-place (projected-gradient non-negativity). No-op when
+        signed. Called by the trainer after each CI-fn optimizer step, so `B` is the effective
+        non-negative decoder everywhere (forward, penalty, inspection) and off-wirings reach
+        exactly 0; an entry at 0 can still revive if a later gradient pushes it positive."""
+        if self.decoder_nonneg:
+            with torch.no_grad():
+                self.B.clamp_(min=0.0)
 
     def _sample_gate(self, logits: Float[Tensor, "... K"]) -> Float[Tensor, "... K"]:
         """Hard-concrete gate (stochastic train / median eval), or deterministic z=sigmoid(logits)."""
@@ -391,8 +405,10 @@ class SpikeGatedCiFn(nn.Module):
         gate = self._sample_gate(logits)
         if self.slab_sigma0 > 0.0:
             gate = gate * (1.0 + self.slab_sigma0 * torch.randn_like(gate))
-        b_eff = F.softplus(self.B) if self.decoder_nonneg else self.B
-        pre_sigmoid = einops.einsum(gate, b_eff, "... K, M K -> ... M")
+        # B is the effective decoder; non-negativity (when enabled) is enforced by `project_nonneg`
+        # after each optimizer step, so off-wirings reach exactly 0 (vs. softplus, which floors at
+        # ~0.69 and disagrees with the raw-B penalty).
+        pre_sigmoid = einops.einsum(gate, self.B, "... K, M K -> ... M")
         split_outputs = torch.split(pre_sigmoid, self.split_sizes, dim=-1)
         return {name: split_outputs[i] for i, name in enumerate(self.layer_order)}
 

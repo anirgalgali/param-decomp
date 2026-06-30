@@ -678,5 +678,12 @@ class Trainer:
                 self.components_optimizer.step()
                 self.ci_fn_optimizer.step()
 
+                # Project any constrained CI-fn parameters back onto their feasible set (e.g. the
+                # spike decoder's non-negativity). No-op for modules without `project_nonneg`.
+                for module in self.component_model.modules():
+                    project = getattr(module, "project_nonneg", None)
+                    if callable(project):
+                        project()
+
         if is_main_process():
             logger.info("Finished training loop.")
