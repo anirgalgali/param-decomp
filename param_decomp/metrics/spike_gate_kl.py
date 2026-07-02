@@ -6,9 +6,10 @@ forward pass stores on `self._pi` exactly once per training step. This is the st
 and, given a non-degenerate decoder, the per-input sparsifier; see
 `docs/slpd_stage1_spike_design.md` in the slpd project.
 
-Known caveat (design §6): the KL is charged on `π = sigmoid(logits)`, while the reconstruction
-gradient flows through the hard-concrete gate whose true on-probability differs. v1 accepts that
-bias; a future option is to charge on the open-gate probability `P(z>0)`.
+The §6 KL/sampler mismatch — the KL charged on `π = sigmoid(logits)` while reconstruction sees the
+hard-concrete gate whose true on-probability differs — is togglable via `charge_on`: `"pi"` (the
+v1 default) or `"open_prob"` (charge on the Louizos open-gate probability `P(z>0)`, matching the
+sampled gate). `effective_K` is always reported on `π` so it stays comparable across both modes.
 """
 
 import math
@@ -32,13 +33,16 @@ class SpikeGateKLLossConfig(LossMetricConfig):
 
     `rho` is the prior gate probability (small ⇒ sparse mechanisms). `free_bits` clamps each
     mechanism's per-batch KL from below (anti-collapse). `kl_warmup_end_frac` linearly ramps the
-    KL weight from 0 to 1 over the first fraction of training (0 ⇒ no warmup).
+    KL weight from 0 to 1 over the first fraction of training (0 ⇒ no warmup). `charge_on` selects
+    the probability the existence cost is charged on: `"pi"` (= sigmoid(logits), v1) or
+    `"open_prob"` (the hard-concrete open-gate probability `P(z>0)`, matching the sampled gate).
     """
 
     type: Literal["SpikeGateKLLoss"] = "SpikeGateKLLoss"
     rho: Probability
     free_bits: NonNegativeFloat = 0.0
     kl_warmup_end_frac: Probability = 0.0
+    charge_on: Literal["pi", "open_prob"] = "pi"
 
 
 def bernoulli_kl(
@@ -72,8 +76,9 @@ class SpikeGateKLLoss(Metric[SpikeGateKLLossConfig]):
         spike_fn = get_spike_gated_ci_fn(ctx.model.ci_fn)
         pi = spike_fn._pi
         assert pi is not None, "CI fn forward must run before SpikeGateKLLoss.update"
+        p = spike_fn.gate_open_prob() if self.cfg.charge_on == "open_prob" else pi
 
-        per_mech = bernoulli_kl(pi, self.cfg.rho)  # [..., K]
+        per_mech = bernoulli_kl(p, self.cfg.rho)  # [..., K]
         per_mech_batch_mean = per_mech.reshape(-1, per_mech.shape[-1]).mean(dim=0)  # [K]
         if self.cfg.free_bits > 0.0:
             per_mech_batch_mean = per_mech_batch_mean.clamp(min=self.cfg.free_bits)

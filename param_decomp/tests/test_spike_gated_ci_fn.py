@@ -1,3 +1,5 @@
+import math
+
 import pytest
 import torch
 from torch import nn
@@ -18,6 +20,7 @@ def _make_fn(**kw) -> SpikeGatedCiFn:
         hard_concrete_stretch=0.1,
         slab_sigma0=0.0,
         decoder_nonneg=False,
+        decoder_init_std=0.1,
     )
     defaults.update(kw)
     return SpikeGatedCiFn(**defaults)
@@ -229,3 +232,33 @@ def test_get_spike_gated_ci_fn_accessor():
     assert get_spike_gated_ci_fn(wrapper) is fn
     with pytest.raises(AssertionError):
         get_spike_gated_ci_fn(nn.Linear(2, 2))
+
+
+def test_gate_open_prob_matches_louizos_formula_and_exceeds_pi():
+    fn = _make_fn(hard_concrete_temp=0.5, hard_concrete_stretch=0.1)
+    fn(_acts())  # populate _logits / _pi
+    gamma, zeta = -fn.stretch, 1.0 + fn.stretch
+    expected = torch.sigmoid(fn._logits - fn.temp * math.log(-gamma / zeta))
+    open_prob = fn.gate_open_prob()
+    assert torch.allclose(open_prob, expected)
+    # the shift -τ·log(stretch/(1+stretch)) > 0, so the gate is open MORE often than π
+    assert bool((open_prob > fn._pi).all())
+
+
+def test_gate_open_prob_approaches_pi_as_temp_to_zero():
+    fn = _make_fn(hard_concrete_temp=1e-5, hard_concrete_stretch=0.1)
+    fn(_acts())
+    assert torch.allclose(fn.gate_open_prob(), fn._pi, atol=1e-3)
+
+
+def test_gate_open_prob_is_pi_for_deterministic_gate():
+    fn = _make_fn(gate_type="deterministic")
+    fn(_acts())
+    assert torch.allclose(fn.gate_open_prob(), fn._pi)
+
+
+def test_decoder_init_std_controls_B_scale():
+    small = _make_fn(decoder_init_std=0.01)
+    large = _make_fn(decoder_init_std=0.5)
+    assert small.B.std().item() == pytest.approx(0.01, rel=0.25)
+    assert large.B.std().item() == pytest.approx(0.5, rel=0.25)

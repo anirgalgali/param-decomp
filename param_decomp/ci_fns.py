@@ -1,5 +1,6 @@
 """Causal-importance function configs, CI-fn modules, and wrappers."""
 
+import math
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -165,6 +166,10 @@ class SpikeGatedCiConfig(BaseConfig):
         description="If True, B is projected to ≥0 after each optimizer step (projected gradient) "
         "so mechanisms only turn components on and off-wirings reach exactly 0.",
     )
+    decoder_init_std: NonNegativeFloat = Field(
+        default=0.1,
+        description="Std of the N(0, std) initialization of the decoder B (fixed, not fan-scaled).",
+    )
 
 
 # Discriminated union (by `mode`) of every CI-fn config the trainer accepts. Pydantic
@@ -323,6 +328,7 @@ class SpikeGatedCiFn(nn.Module):
         hard_concrete_stretch: float,
         slab_sigma0: float,
         decoder_nonneg: bool,
+        decoder_init_std: float,
     ):
         super().__init__()
         self.layer_order = sorted(layer_configs.keys())
@@ -340,6 +346,7 @@ class SpikeGatedCiFn(nn.Module):
         self.stretch = hard_concrete_stretch
         self.slab_sigma0 = slab_sigma0
         self.decoder_nonneg = decoder_nonneg
+        self.decoder_init_std = decoder_init_std
 
         self.encoder = nn.Sequential()
         for i in range(len(encoder_hidden_dims)):
@@ -350,14 +357,16 @@ class SpikeGatedCiFn(nn.Module):
         self.encoder.append(Linear(final_dim, n_mechanisms, nonlinearity="linear"))
 
         self.B = nn.Parameter(torch.empty(self.M, n_mechanisms))
-        nn.init.normal_(self.B, std=0.1)
+        nn.init.normal_(self.B, std=self.decoder_init_std)
         if self.decoder_nonneg:
             # Start every wiring positive ("on"); the penalty + recon prune toward 0 under the
             # per-step projection (`project_nonneg`). Same magnitude as the signed init.
             self.B.data.abs_()
 
-        # Cached per forward for SpikeGateKLLoss; None until the first forward.
+        # Cached per forward for SpikeGateKLLoss; None until the first forward. `_logits` backs
+        # the hard-concrete open-probability `gate_open_prob()`; `_pi = sigmoid(_logits)`.
         self._pi: Float[Tensor, "... K"] | None = None
+        self._logits: Float[Tensor, "... K"] | None = None
 
         # When true, the hard-concrete gate uses its noise-off (median) branch even in
         # training mode. Set transiently via `force_deterministic_gate` so the adversarial
@@ -411,6 +420,17 @@ class SpikeGatedCiFn(nn.Module):
             s = torch.sigmoid(logits)
         return (s * (zeta - gamma) + gamma).clamp(0.0, 1.0)
 
+    def gate_open_prob(self) -> Float[Tensor, "... K"]:
+        """`P(z_k > 0)` for the hard-concrete gate at the current temperature (Louizos L0):
+        `sigmoid(logits - τ·log(-γ/ζ))`, the probability the stretched-and-clamped gate is open.
+        Differs from `π = sigmoid(logits)` while `τ > 0`; → π as τ → 0. Deterministic gate ⇒ π."""
+        assert self._logits is not None, "forward must run before gate_open_prob"
+        if self.gate_type == "deterministic":
+            return torch.sigmoid(self._logits)
+        assert self.stretch > 0.0, "open-prob requires hard_concrete_stretch > 0"
+        gamma, zeta = -self.stretch, 1.0 + self.stretch
+        return torch.sigmoid(self._logits - self.temp * math.log(-gamma / zeta))
+
     @override
     def forward(
         self,
@@ -418,6 +438,7 @@ class SpikeGatedCiFn(nn.Module):
     ) -> dict[str, Float[Tensor, "... C"]]:
         concatenated = torch.cat([input_acts[name] for name in self.layer_order], dim=-1)
         logits = self.encoder(concatenated)
+        self._logits = logits
         self._pi = torch.sigmoid(logits)
         gate = self._sample_gate(logits)
         if self.slab_sigma0 > 0.0:
@@ -694,6 +715,7 @@ def _make_spike_gated_ci_fn(
         hard_concrete_stretch=ci_config.hard_concrete_stretch,
         slab_sigma0=ci_config.slab_sigma0,
         decoder_nonneg=ci_config.decoder_nonneg,
+        decoder_init_std=ci_config.decoder_init_std,
     )
 
 
