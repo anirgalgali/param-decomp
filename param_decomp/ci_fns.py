@@ -170,6 +170,12 @@ class SpikeGatedCiConfig(BaseConfig):
         default=0.1,
         description="Std of the N(0, std) initialization of the decoder B (fixed, not fan-scaled).",
     )
+    encoder_head_init_scale: PositiveFloat = Field(
+        default=1.0,
+        description="Multiplier applied to the final encoder Linear (logit-head) weight after "
+        "init; scales the initial logit spread hence the initial per-mechanism π diversity. "
+        "1.0 ⇒ unchanged.",
+    )
 
 
 # Discriminated union (by `mode`) of every CI-fn config the trainer accepts. Pydantic
@@ -329,6 +335,7 @@ class SpikeGatedCiFn(nn.Module):
         slab_sigma0: float,
         decoder_nonneg: bool,
         decoder_init_std: float,
+        encoder_head_init_scale: float,
     ):
         super().__init__()
         self.layer_order = sorted(layer_configs.keys())
@@ -355,6 +362,9 @@ class SpikeGatedCiFn(nn.Module):
             self.encoder.append(nn.GELU())
         final_dim = encoder_hidden_dims[-1] if encoder_hidden_dims else total_input_dim
         self.encoder.append(Linear(final_dim, n_mechanisms, nonlinearity="linear"))
+        if encoder_head_init_scale != 1.0:
+            with torch.no_grad():
+                self.encoder[-1].W.mul_(encoder_head_init_scale)
 
         self.B = nn.Parameter(torch.empty(self.M, n_mechanisms))
         nn.init.normal_(self.B, std=self.decoder_init_std)
@@ -716,6 +726,7 @@ def _make_spike_gated_ci_fn(
         slab_sigma0=ci_config.slab_sigma0,
         decoder_nonneg=ci_config.decoder_nonneg,
         decoder_init_std=ci_config.decoder_init_std,
+        encoder_head_init_scale=ci_config.encoder_head_init_scale,
     )
 
 

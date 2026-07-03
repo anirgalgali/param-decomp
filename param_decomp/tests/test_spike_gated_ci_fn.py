@@ -21,6 +21,7 @@ def _make_fn(**kw) -> SpikeGatedCiFn:
         slab_sigma0=0.0,
         decoder_nonneg=False,
         decoder_init_std=0.1,
+        encoder_head_init_scale=1.0,
     )
     defaults.update(kw)
     return SpikeGatedCiFn(**defaults)
@@ -262,3 +263,13 @@ def test_decoder_init_std_controls_B_scale():
     large = _make_fn(decoder_init_std=0.5)
     assert small.B.std().item() == pytest.approx(0.01, rel=0.25)
     assert large.B.std().item() == pytest.approx(0.5, rel=0.25)
+
+
+def test_encoder_head_init_scale_scales_final_head():
+    torch.manual_seed(0)
+    base = _make_fn(encoder_head_init_scale=1.0)
+    torch.manual_seed(0)
+    scaled = _make_fn(encoder_head_init_scale=3.0)
+    assert torch.allclose(scaled.encoder[-1].W, 3.0 * base.encoder[-1].W)
+    # only the final head is touched; hidden weights are identical under the same seed
+    assert torch.allclose(scaled.encoder[0].W, base.encoder[0].W)
