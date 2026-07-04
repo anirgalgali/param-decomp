@@ -1,7 +1,7 @@
 """Causal-importance function configs, CI-fn modules, and wrappers."""
 
 import math
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Literal, Self, override
@@ -383,6 +383,11 @@ class SpikeGatedCiFn(nn.Module):
         # recon term attacks the deterministic gate `z̄` (the deployed network).
         self._force_deterministic_gate: bool = False
 
+        # Optional oracle-gate override: when set, `forward` uses `self._oracle_z_fn(input_acts)`
+        # as the gate instead of the encoder-driven sample (the encoder still runs so `_pi`/`_logits`
+        # stay populated for any KL term). Used by the oracle-freeze validation experiments.
+        self._oracle_z_fn: "Callable[[dict[str, Tensor]], Tensor] | None" = None
+
     @contextmanager
     def force_deterministic_gate(self) -> Iterator[None]:
         """Force the noise-off (median) gate for the duration of the block."""
@@ -450,7 +455,7 @@ class SpikeGatedCiFn(nn.Module):
         logits = self.encoder(concatenated)
         self._logits = logits
         self._pi = torch.sigmoid(logits)
-        gate = self._sample_gate(logits)
+        gate = self._oracle_z_fn(input_acts) if self._oracle_z_fn is not None else self._sample_gate(logits)
         if self.slab_sigma0 > 0.0:
             gate = gate * (1.0 + self.slab_sigma0 * torch.randn_like(gate))
         # B is the effective decoder; non-negativity (when enabled) is enforced by `project_nonneg`
