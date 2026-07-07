@@ -17,7 +17,7 @@ from typing import Literal, override
 
 import torch
 from jaxtyping import Float
-from pydantic import NonNegativeFloat
+from pydantic import NonNegativeFloat, NonNegativeInt
 from torch import Tensor
 from torch.distributed import ReduceOp
 
@@ -42,6 +42,7 @@ class SpikeGateKLLossConfig(LossMetricConfig):
     rho: Probability
     free_bits: NonNegativeFloat = 0.0
     kl_warmup_end_frac: Probability = 0.0
+    kl_warmup_end_steps: NonNegativeInt = 0
     charge_on: Literal["pi", "open_prob"] = "pi"
 
 
@@ -54,9 +55,7 @@ def bernoulli_kl(
     is representable in fp32 (unlike `1-1e-8`, which rounds to `1.0`).
     """
     pi = pi.float().clamp(eps, 1.0 - eps)
-    return pi * (torch.log(pi) - math.log(rho)) + (1.0 - pi) * (
-        torch.log1p(-pi) - math.log1p(-rho)
-    )
+    return pi * (torch.log(pi) - math.log(rho)) + (1.0 - pi) * (torch.log1p(-pi) - math.log1p(-rho))
 
 
 class SpikeGateKLLoss(Metric[SpikeGateKLLossConfig]):
@@ -84,7 +83,13 @@ class SpikeGateKLLoss(Metric[SpikeGateKLLossConfig]):
             per_mech_batch_mean = per_mech_batch_mean.clamp(min=self.cfg.free_bits)
         loss = per_mech_batch_mean.sum()
 
-        if self.cfg.kl_warmup_end_frac > 0.0:
+        assert not (self.cfg.kl_warmup_end_frac > 0.0 and self.cfg.kl_warmup_end_steps > 0), (
+            "set at most one of kl_warmup_end_frac / kl_warmup_end_steps"
+        )
+        if self.cfg.kl_warmup_end_steps > 0:
+            warmup = min(1.0, ctx.step / self.cfg.kl_warmup_end_steps)
+            loss = warmup * loss
+        elif self.cfg.kl_warmup_end_frac > 0.0:
             warmup = min(1.0, ctx.current_frac_of_training / self.cfg.kl_warmup_end_frac)
             loss = warmup * loss
 

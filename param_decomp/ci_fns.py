@@ -141,7 +141,8 @@ class SpikeGatedCiConfig(BaseConfig):
         description="`hard_concrete` = stochastic spike; `deterministic` = z=sigmoid(logits).",
     )
     hard_concrete_temp: PositiveFloat = Field(
-        default=0.5, description="Binary/hard-concrete temperature τ (the start value when annealing)."
+        default=0.5,
+        description="Binary/hard-concrete temperature τ (the start value when annealing).",
     )
     hard_concrete_temp_final: PositiveFloat | None = Field(
         default=None,
@@ -152,7 +153,8 @@ class SpikeGatedCiConfig(BaseConfig):
         default=0.0, description="Fraction of training at which τ annealing begins."
     )
     temp_anneal_end_frac: Probability = Field(
-        default=1.0, description="Fraction of training at which τ reaches `hard_concrete_temp_final`."
+        default=1.0,
+        description="Fraction of training at which τ reaches `hard_concrete_temp_final`.",
     )
     hard_concrete_stretch: NonNegativeFloat = Field(
         default=0.1, description="Hard-concrete stretch s; the interval is (γ,ζ)=(-s, 1+s)."
@@ -378,6 +380,13 @@ class SpikeGatedCiFn(nn.Module):
         self._pi: Float[Tensor, "... K"] | None = None
         self._logits: Float[Tensor, "... K"] | None = None
 
+        # Opt-in diagnostics: when true, `forward` retains grad on the sampled gate `z` and the
+        # decoder pre-sigmoid `η`, exposing `∂L/∂z_k` and `∂L/∂η_c`. Both hold the last forward's
+        # tensor (a step runs several forwards); see `slpd/collapse_diagnostics.py`.
+        self._capture_grads: bool = False
+        self._captured_gate: Tensor | None = None
+        self._captured_pre_sigmoid: Tensor | None = None
+
         # When true, the hard-concrete gate uses its noise-off (median) branch even in
         # training mode. Set transiently via `force_deterministic_gate` so the adversarial
         # recon term attacks the deterministic gate `z̄` (the deployed network).
@@ -386,7 +395,7 @@ class SpikeGatedCiFn(nn.Module):
         # Optional oracle-gate override: when set, `forward` uses `self._oracle_z_fn(input_acts)`
         # as the gate instead of the encoder-driven sample (the encoder still runs so `_pi`/`_logits`
         # stay populated for any KL term). Used by the oracle-freeze validation experiments.
-        self._oracle_z_fn: "Callable[[dict[str, Tensor]], Tensor] | None" = None
+        self._oracle_z_fn: Callable[[dict[str, Tensor]], Tensor] | None = None
 
     @contextmanager
     def force_deterministic_gate(self) -> Iterator[None]:
@@ -455,13 +464,24 @@ class SpikeGatedCiFn(nn.Module):
         logits = self.encoder(concatenated)
         self._logits = logits
         self._pi = torch.sigmoid(logits)
-        gate = self._oracle_z_fn(input_acts) if self._oracle_z_fn is not None else self._sample_gate(logits)
+        gate = (
+            self._oracle_z_fn(input_acts)
+            if self._oracle_z_fn is not None
+            else self._sample_gate(logits)
+        )
         if self.slab_sigma0 > 0.0:
             gate = gate * (1.0 + self.slab_sigma0 * torch.randn_like(gate))
         # B is the effective decoder; non-negativity (when enabled) is enforced by `project_nonneg`
         # after each optimizer step, so off-wirings reach exactly 0 (vs. softplus, which floors at
         # ~0.69 and disagrees with the raw-B penalty).
         pre_sigmoid = einops.einsum(gate, self.B, "... K, M K -> ... M")
+        if self._capture_grads:
+            if gate.requires_grad:
+                gate.retain_grad()
+                self._captured_gate = gate
+            if pre_sigmoid.requires_grad:
+                pre_sigmoid.retain_grad()
+                self._captured_pre_sigmoid = pre_sigmoid
         split_outputs = torch.split(pre_sigmoid, self.split_sizes, dim=-1)
         return {name: split_outputs[i] for i, name in enumerate(self.layer_order)}
 

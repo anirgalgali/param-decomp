@@ -637,6 +637,14 @@ class Trainer:
                 if gate_temp is not None:
                     batch_log_data["schedules/gate_temp"] = gate_temp
 
+                # Opt-in per-step diagnostics (no-op unless a hook is attached, e.g. via a
+                # `pre_run_hook`). Runs post-backward so param and retained-tensor grads are live;
+                # the hook logs its own `diag/*` keys straight to the sink (kept off `batch_log_data`
+                # so the console/rank-average path stays float-only).
+                diagnostics_hook = getattr(self, "_diagnostics_hook", None)
+                if diagnostics_hook is not None:
+                    diagnostics_hook.log_diagnostics(step, ctx, self.component_model, sink)
+
                 sink.console(
                     f"--- Step {step} ---",
                     f"LR[components]: {components_lr:.6f}",

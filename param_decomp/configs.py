@@ -236,7 +236,17 @@ class Cadence(BaseConfig):
     intermediate checkpoints; the final-step checkpoint is always included in the
     retained set."""
 
+    dense_log_until: PositiveInt | None = None
+    dense_log_every: PositiveInt | None = None
+    """Opt-in dense-early train logging: for ``step < dense_log_until`` the log period is
+    ``dense_log_every`` instead of ``train_log_every`` (both must be set together). Lets the
+    first, fast-moving steps be logged densely without flooding the whole run. ``None`` ⇒ plain
+    ``train_log_every`` throughout."""
+
     def should_log_train(self, step: int) -> bool:
+        if self.dense_log_until is not None and step < self.dense_log_until:
+            assert self.dense_log_every is not None, "dense_log_until requires dense_log_every"
+            return step % self.dense_log_every == 0
         return step % self.train_log_every == 0
 
     def should_save(self, step: int) -> bool:

@@ -73,6 +73,12 @@ class Components(ABC, nn.Module):
         init_param_(self.V, fan_val=v_dim, nonlinearity="linear")
         init_param_(self.U, fan_val=C, nonlinearity="linear")
 
+        # Opt-in diagnostics: when true, `forward` retains grad on the masked component
+        # activations (the tensor U reads), exposing write-out utility `⟨∇_o L, U_i⟩` per
+        # component. Holds the last forward's tensor; see `slpd/collapse_diagnostics.py`.
+        self._capture_grads: bool = False
+        self._captured_component_acts: Tensor | None = None
+
     @property
     @abstractmethod
     def weight(self) -> Float[Tensor, "rows cols"]:
@@ -148,6 +154,10 @@ class LinearComponents(Components):
 
         if mask is not None:
             component_acts = component_acts * mask
+
+        if self._capture_grads and component_acts.requires_grad:
+            component_acts.retain_grad()
+            self._captured_component_acts = component_acts
 
         out = einops.einsum(component_acts, self.U, "... C, C d_out -> ... d_out")
 
