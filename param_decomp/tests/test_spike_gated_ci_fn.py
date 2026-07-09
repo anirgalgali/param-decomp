@@ -22,6 +22,8 @@ def _make_fn(**kw) -> SpikeGatedCiFn:
         decoder_nonneg=False,
         decoder_init_std=0.1,
         encoder_head_init_scale=1.0,
+        center_logits=False,
+        center_logits_until_frac=1.0,
     )
     defaults.update(kw)
     return SpikeGatedCiFn(**defaults)
@@ -273,3 +275,47 @@ def test_encoder_head_init_scale_scales_final_head():
     assert torch.allclose(scaled.encoder[-1].W, 3.0 * base.encoder[-1].W)
     # only the final head is touched; hidden weights are identical under the same seed
     assert torch.allclose(scaled.encoder[0].W, base.encoder[0].W)
+
+
+def test_center_logits_zeroes_logit_mean_over_mechanisms():
+    fn = _make_fn(center_logits=True)
+    fn(_acts())
+    assert torch.allclose(fn._logits.mean(dim=-1), torch.zeros(4), atol=1e-6)
+
+
+def test_center_logits_makes_gate_shift_invariant():
+    """Adding a constant to the logit-head bias shifts every logit equally; centering removes it,
+    so `_pi` (and hence the whole forward) is invariant to that common-mode shift."""
+    fn = _make_fn(center_logits=True)
+    acts = _acts()
+    fn.eval()
+    before = fn(acts)["linear1"].clone()
+    pi_before = fn._pi.clone()
+    with torch.no_grad():
+        fn.encoder[-1].b.add_(2.7)
+    after = fn(acts)["linear1"]
+    assert torch.allclose(pi_before, fn._pi, atol=1e-6)
+    assert torch.allclose(before, after, atol=1e-6)
+
+
+def test_center_logits_off_is_not_shift_invariant():
+    """Regression guard: with centering off (the default), the same bias shift DOES change the
+    forward — i.e. centering, not some other path, is what buys invariance."""
+    fn = _make_fn(center_logits=False)
+    acts = _acts()
+    fn.eval()
+    before = fn(acts)["linear1"].clone()
+    with torch.no_grad():
+        fn.encoder[-1].b.add_(2.7)
+    after = fn(acts)["linear1"]
+    assert not torch.allclose(before, after, atol=1e-4)
+
+
+def test_center_logits_until_frac_switches_off_after_window():
+    fn = _make_fn(center_logits=True, center_logits_until_frac=0.1)
+    fn.anneal_temperature(0.05)  # inside the window: centering active
+    fn(_acts())
+    assert torch.allclose(fn._logits.mean(dim=-1), torch.zeros(4), atol=1e-6)
+    fn.anneal_temperature(0.5)  # past the window: centering off
+    fn(_acts())
+    assert not torch.allclose(fn._logits.mean(dim=-1), torch.zeros(4), atol=1e-4)

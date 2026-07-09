@@ -178,6 +178,17 @@ class SpikeGatedCiConfig(BaseConfig):
         "init; scales the initial logit spread hence the initial per-mechanism π diversity. "
         "1.0 ⇒ unchanged.",
     )
+    center_logits: bool = Field(
+        default=False,
+        description="If True, center the encoder logits per datapoint (subtract the mean over "
+        "mechanisms) before the gate, making the gate shift-invariant. Kills the common-mode "
+        "'raise all logits' direction (the mildest form of top-K's rank invariance).",
+    )
+    center_logits_until_frac: Probability = Field(
+        default=1.0,
+        description="Fraction of training over which `center_logits` stays active; centering "
+        "switches off once `current_frac >= center_logits_until_frac`. 1.0 ⇒ whole run.",
+    )
 
 
 # Discriminated union (by `mode`) of every CI-fn config the trainer accepts. Pydantic
@@ -338,6 +349,8 @@ class SpikeGatedCiFn(nn.Module):
         decoder_nonneg: bool,
         decoder_init_std: float,
         encoder_head_init_scale: float,
+        center_logits: bool,
+        center_logits_until_frac: float,
     ):
         super().__init__()
         self.layer_order = sorted(layer_configs.keys())
@@ -356,6 +369,10 @@ class SpikeGatedCiFn(nn.Module):
         self.slab_sigma0 = slab_sigma0
         self.decoder_nonneg = decoder_nonneg
         self.decoder_init_std = decoder_init_std
+        # `_center_active` is refreshed per-step from `current_frac` by `anneal_temperature`.
+        self.center_logits = center_logits
+        self._center_logits_until_frac = center_logits_until_frac
+        self._center_active = True
 
         self.encoder = nn.Sequential()
         for i in range(len(encoder_hidden_dims)):
@@ -411,7 +428,11 @@ class SpikeGatedCiFn(nn.Module):
         """Set `self.temp` by linearly annealing `_temp_start → _temp_final` over the configured
         fraction window. No-op when `_temp_final is None`. Called once per training step by the
         trainer (mirrors the importance-minimality p-anneal); recomputed from scratch so it is
-        resume-safe. Only the stochastic (training) hard-concrete branch reads `self.temp`."""
+        resume-safe. Only the stochastic (training) hard-concrete branch reads `self.temp`.
+        Also refreshes `_center_active` (logit-centering window) from `current_frac`."""
+        self._center_active = (
+            self._center_logits_until_frac >= 1.0 or current_frac < self._center_logits_until_frac
+        )
         if self._temp_final is None:
             return
         start, end = self._temp_anneal_start_frac, self._temp_anneal_end_frac
@@ -462,6 +483,8 @@ class SpikeGatedCiFn(nn.Module):
     ) -> dict[str, Float[Tensor, "... C"]]:
         concatenated = torch.cat([input_acts[name] for name in self.layer_order], dim=-1)
         logits = self.encoder(concatenated)
+        if self.center_logits and self._center_active:
+            logits = logits - logits.mean(dim=-1, keepdim=True)
         self._logits = logits
         self._pi = torch.sigmoid(logits)
         gate = (
@@ -752,6 +775,8 @@ def _make_spike_gated_ci_fn(
         decoder_nonneg=ci_config.decoder_nonneg,
         decoder_init_std=ci_config.decoder_init_std,
         encoder_head_init_scale=ci_config.encoder_head_init_scale,
+        center_logits=ci_config.center_logits,
+        center_logits_until_frac=ci_config.center_logits_until_frac,
     )
 
 
