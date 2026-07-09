@@ -26,6 +26,7 @@ from param_decomp.metrics.ci_masked_recon_layerwise import CIMaskedReconLayerwis
 from param_decomp.metrics.ci_masked_recon_subset import CIMaskedReconSubsetLossConfig
 from param_decomp.metrics.decoder_column_mass import DecoderColumnMassLossConfig
 from param_decomp.metrics.decoder_row_mass import DecoderRowMassLossConfig
+from param_decomp.metrics.decoder_usage_price import EpsilonPriceLossConfig
 from param_decomp.metrics.faithfulness import FaithfulnessLossConfig
 from param_decomp.metrics.importance_minimality import ImportanceMinimalityLossConfig
 from param_decomp.metrics.persistent_pgd_recon import (
@@ -62,6 +63,7 @@ AnyLossMetricConfig = Annotated[
     | CIMaskedReconSubsetLossConfig
     | DecoderColumnMassLossConfig
     | DecoderRowMassLossConfig
+    | EpsilonPriceLossConfig
     | FaithfulnessLossConfig
     | ImportanceMinimalityLossConfig
     | PersistentPGDReconLossConfig

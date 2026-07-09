@@ -13,6 +13,7 @@ from param_decomp.metrics.ci_masked_recon_layerwise import CIMaskedReconLayerwis
 from param_decomp.metrics.ci_masked_recon_subset import CIMaskedReconSubsetLoss
 from param_decomp.metrics.decoder_column_mass import DecoderColumnMassLoss
 from param_decomp.metrics.decoder_row_mass import DecoderRowMassLoss
+from param_decomp.metrics.decoder_usage_price import EpsilonPriceLoss
 from param_decomp.metrics.faithfulness import FaithfulnessLoss
 from param_decomp.metrics.importance_minimality import ImportanceMinimalityLoss
 from param_decomp.metrics.persistent_pgd_recon import (
@@ -37,6 +38,7 @@ LOSS_METRIC_CLASSES: dict[str, type[Metric[Any]]] = {
         CIMaskedReconSubsetLoss,
         DecoderColumnMassLoss,
         DecoderRowMassLoss,
+        EpsilonPriceLoss,
         FaithfulnessLoss,
         ImportanceMinimalityLoss,
         PersistentPGDReconLoss,
