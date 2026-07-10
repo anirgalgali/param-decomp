@@ -136,9 +136,11 @@ class SpikeGatedCiConfig(BaseConfig):
     n_mechanisms: PositiveInt = Field(
         ..., description="Number of latent mechanisms K (overcomplete vs. expected count)."
     )
-    gate_type: Literal["hard_concrete", "deterministic"] = Field(
+    gate_type: Literal["hard_concrete", "deterministic", "straight_through"] = Field(
         default="hard_concrete",
-        description="`hard_concrete` = stochastic spike; `deterministic` = z=sigmoid(logits).",
+        description="`hard_concrete` = stochastic spike; `deterministic` = z=sigmoid(logits); "
+        "`straight_through` = Bernoulli(σ(ℓ)) sample with a σ'(ℓ) straight-through backward "
+        "(no temperature/stretch; the minimal-bottleneck gate).",
     )
     hard_concrete_temp: PositiveFloat = Field(
         default=0.5,
@@ -457,6 +459,14 @@ class SpikeGatedCiFn(nn.Module):
         """Hard-concrete gate (stochastic train / median eval), or deterministic z=sigmoid(logits)."""
         if self.gate_type == "deterministic":
             return torch.sigmoid(logits)
+        if self.gate_type == "straight_through":
+            pi = torch.sigmoid(logits)
+            hard = (
+                torch.bernoulli(pi)
+                if (self.training and not self._force_deterministic_gate)
+                else (pi > 0.5).to(pi.dtype)
+            )
+            return hard + (pi - pi.detach())  # forward = hard binary; backward ∂z/∂ℓ = σ'(ℓ)
         gamma, zeta = -self.stretch, 1.0 + self.stretch
         if self.training and not self._force_deterministic_gate:
             u = torch.rand_like(logits).clamp(1e-6, 1.0 - 1e-6)
@@ -470,8 +480,10 @@ class SpikeGatedCiFn(nn.Module):
         `sigmoid(logits - τ·log(-γ/ζ))`, the probability the stretched-and-clamped gate is open.
         Differs from `π = sigmoid(logits)` while `τ > 0`; → π as τ → 0. Deterministic gate ⇒ π."""
         assert self._logits is not None, "forward must run before gate_open_prob"
-        if self.gate_type == "deterministic":
-            return torch.sigmoid(self._logits)
+        if self.gate_type in ("deterministic", "straight_through"):
+            return torch.sigmoid(
+                self._logits
+            )  # π is the true firing prob; no temp/stretch correction
         assert self.stretch > 0.0, "open-prob requires hard_concrete_stretch > 0"
         gamma, zeta = -self.stretch, 1.0 + self.stretch
         return torch.sigmoid(self._logits - self.temp * math.log(-gamma / zeta))

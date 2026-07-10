@@ -146,6 +146,54 @@ def test_deterministic_nonneg_pre_sigmoid_is_nonnegative():
     assert bool((out["linear1"] >= 0).all()) and bool((out["linear2"] >= 0).all())
 
 
+def test_straight_through_eval_is_threshold_gate():
+    fn = _make_fn(gate_type="straight_through")
+    acts = _acts()
+    fn.eval()
+    out = torch.cat([v for v in fn(acts).values()], dim=-1)
+    z_bar = (fn._pi > 0.5).to(fn._pi.dtype)
+    assert torch.allclose(out, z_bar @ fn.B.t(), atol=1e-6)
+
+
+def test_straight_through_train_gate_is_binary():
+    fn = _make_fn(gate_type="straight_through")
+    fn.train()
+    fn._capture_grads = True
+    fn(_acts())
+    gate = fn._captured_gate
+    assert gate is not None
+    assert torch.equal(gate.detach(), gate.detach().round())  # exactly {0, 1} in the forward
+
+
+def test_straight_through_train_stochastic_eval_deterministic():
+    fn = _make_fn(gate_type="straight_through")
+    acts = _acts()
+    fn.eval()
+    assert torch.allclose(fn(acts)["linear1"], fn(acts)["linear1"])
+    fn.train()
+    torch.manual_seed(1)
+    a = fn(acts)["linear1"]
+    torch.manual_seed(2)
+    b = fn(acts)["linear1"]
+    assert not torch.allclose(a, b)
+
+
+def test_straight_through_grad_reaches_encoder_and_decoder():
+    fn = _make_fn(gate_type="straight_through")
+    fn.train()
+    out = fn(_acts())
+    loss = sum(v.pow(2).mean() for v in out.values())
+    loss.backward()
+    assert fn.B.grad is not None and fn.B.grad.abs().sum() > 0
+    assert fn.encoder[0].W.grad is not None and fn.encoder[0].W.grad.abs().sum() > 0
+
+
+def test_straight_through_gate_open_prob_is_pi():
+    fn = _make_fn(gate_type="straight_through")
+    fn(_acts())
+    assert torch.allclose(fn.gate_open_prob(), fn._pi)
+
+
 def test_nonneg_init_is_nonnegative():
     fn = _make_fn(decoder_nonneg=True)
     assert bool((fn.B >= 0).all())
