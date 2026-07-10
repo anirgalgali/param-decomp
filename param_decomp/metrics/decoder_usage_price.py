@@ -21,13 +21,41 @@ from param_decomp.metrics.base import LossMetricConfig, Metric, MetricResult
 from param_decomp.metrics.context import MetricContext
 
 
+def annealed_epsilon(
+    peak: float,
+    final: float | None,
+    start_frac: float,
+    end_frac: float,
+    frac: float,
+) -> float:
+    """Log-linear ε schedule: `peak` for `frac ≤ start_frac`, `final` for `frac ≥ end_frac`,
+    geometric interpolation between (held flat outside). `final=None` ⇒ constant `peak`."""
+    if final is None:
+        return peak
+    assert peak > 0.0 and final > 0.0, "log-linear ε anneal needs positive endpoints"
+    assert end_frac >= start_frac
+    if frac <= start_frac:
+        return peak
+    if frac >= end_frac:
+        return final
+    progress = (frac - start_frac) / (end_frac - start_frac)
+    return peak * (final / peak) ** progress
+
+
 class EpsilonPriceLossConfig(LossMetricConfig):
     """`charge_on` selects the per-datapoint usage `z_k(x)` the column mass is weighted by:
     `"open_prob"` (the hard-concrete `P(z>0)`, matching the sampled gate) or `"pi"` (sigmoid logits).
+
+    ε annealing (log-linear, homotopy): `coeff` is the peak ε; `anneal_final_coeff` the floor
+    (None ⇒ constant ε). `anneal_start_frac`/`anneal_end_frac` bound the decay window in
+    training-fraction units; ε is held at the floor after `anneal_end_frac`.
     """
 
     type: Literal["EpsilonPriceLoss"] = "EpsilonPriceLoss"
     charge_on: Literal["pi", "open_prob"] = "open_prob"
+    anneal_final_coeff: float | None = None
+    anneal_start_frac: float = 0.0
+    anneal_end_frac: float = 1.0
 
 
 class EpsilonPriceLoss(Metric[EpsilonPriceLossConfig]):
@@ -48,7 +76,16 @@ class EpsilonPriceLoss(Metric[EpsilonPriceLossConfig]):
         z = spike_fn.gate_open_prob() if self.cfg.charge_on == "open_prob" else spike_fn._pi
         assert z is not None, "CI fn forward must run before EpsilonPriceLoss.update"
         usage = z.reshape(-1, z.shape[-1]).mean(dim=0)  # [K]  E_x[z_k]
-        loss = (column_mass * usage).sum()
+        assert self.cfg.coeff is not None
+        eff = annealed_epsilon(
+            self.cfg.coeff,
+            self.cfg.anneal_final_coeff,
+            self.cfg.anneal_start_frac,
+            self.cfg.anneal_end_frac,
+            ctx.current_frac_of_training,
+        )
+        self._effective_coeff = eff
+        loss = (eff / self.cfg.coeff) * (column_mass * usage).sum()
         self.sum_loss += loss.detach()
         self.n_batches += 1
         return loss
