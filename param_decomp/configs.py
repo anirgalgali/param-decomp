@@ -28,6 +28,7 @@ from param_decomp.metrics.decoder_column_mass import DecoderColumnMassLossConfig
 from param_decomp.metrics.decoder_row_mass import DecoderRowMassLossConfig
 from param_decomp.metrics.decoder_usage_price import EpsilonPriceLossConfig
 from param_decomp.metrics.faithfulness import FaithfulnessLossConfig
+from param_decomp.metrics.hier_dl import TwoPartCodeLossConfig
 from param_decomp.metrics.importance_minimality import ImportanceMinimalityLossConfig
 from param_decomp.metrics.persistent_pgd_recon import (
     PersistentPGDReconLossConfig,
@@ -76,6 +77,7 @@ AnyLossMetricConfig = Annotated[
     | StochasticReconLayerwiseLossConfig
     | StochasticReconLossConfig
     | StochasticReconSubsetLossConfig
+    | TwoPartCodeLossConfig
     | UnmaskedReconLossConfig,
     Discriminator("type"),
 ]

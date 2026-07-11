@@ -15,6 +15,7 @@ from param_decomp.metrics.decoder_column_mass import DecoderColumnMassLoss
 from param_decomp.metrics.decoder_row_mass import DecoderRowMassLoss
 from param_decomp.metrics.decoder_usage_price import EpsilonPriceLoss
 from param_decomp.metrics.faithfulness import FaithfulnessLoss
+from param_decomp.metrics.hier_dl import TwoPartCodeLoss
 from param_decomp.metrics.importance_minimality import ImportanceMinimalityLoss
 from param_decomp.metrics.persistent_pgd_recon import (
     PersistentPGDReconLoss,
@@ -51,6 +52,7 @@ LOSS_METRIC_CLASSES: dict[str, type[Metric[Any]]] = {
         StochasticReconLayerwiseLoss,
         StochasticReconLoss,
         StochasticReconSubsetLoss,
+        TwoPartCodeLoss,
         UnmaskedReconLoss,
     )
 }

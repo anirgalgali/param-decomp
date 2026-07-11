@@ -10,11 +10,19 @@ import einops
 import torch
 import torch.nn.functional as F
 from jaxtyping import Float
-from pydantic import Field, NonNegativeFloat, PositiveFloat, PositiveInt, model_validator
+from pydantic import (
+    Field,
+    NonNegativeFloat,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+    model_validator,
+)
 from torch import Tensor, nn
 
 from param_decomp.base_config import BaseConfig, Probability
 from param_decomp.ci_nn_blocks import Linear, ParallelLinear, TransformerBlock
+from param_decomp.ci_sigmoids import lower_leaky_hard_sigmoid, upper_leaky_hard_sigmoid
 from param_decomp.components import Components, EmbeddingComponents, get_module_input_dim
 
 LayerwiseCiFnType = Literal["mlp", "vector_mlp", "shared_mlp"]
@@ -193,9 +201,54 @@ class SpikeGatedCiConfig(BaseConfig):
     )
 
 
+class HierarchicalCiConfig(BaseConfig):
+    """VPD-hier two-level causal importance `g_c = γ_{k(c)} · h_c` (group × interior gate), tied by a
+    fixed input-independent assignment `k(c)`. A shared trunk emits `K` group logits + `M` interior
+    logits; the composed gate `g ∈ [0,1]` is returned per layer. No sampler — gates stay deterministic
+    (VPD's leaky-hard sigmoids). Priced by `TwoPartCodeLoss`; see `docs/hier_ci_implementation_plan.md`.
+    """
+
+    mode: Literal["hierarchical"] = "hierarchical"
+    n_groups: PositiveInt = Field(
+        ...,
+        description="Total group gates K = real groups + bottleneck group(s) + dead singletons.",
+    )
+    k_of_c: list[NonNegativeInt] = Field(
+        ...,
+        description="Fixed assignment: `k_of_c[c]` is the group index of subcomponent c over the "
+        "global column order (sorted layer names, then per-layer C). Length must equal C_total.",
+    )
+    trunk_hidden_dims: list[PositiveInt] = Field(
+        ..., description="Hidden dims of the shared trunk (empty list ⇒ a linear trunk)."
+    )
+    h_init_bias: float = Field(
+        default=4.0,
+        description="Positive bias added to the interior (h) logit head at init ⇒ h≈1 at step 0, so "
+        "g≈γ (the system starts as group-level VPD; doc §2.3).",
+    )
+    gamma_init_scale: PositiveFloat = Field(
+        default=1.0, description="Multiplier on the group (γ) logit-head output columns after init."
+    )
+    event_indicator: Literal["p_anneal", "hard_concrete"] = Field(
+        default="p_anneal",
+        description="Event indicator shared with Terms F/H: `p_anneal` = |·|^p homotopy (E1 default); "
+        "`hard_concrete` = Louizos atom probability of the pre-sigmoid logit (E5; not yet wired).",
+    )
+
+    @model_validator(mode="after")
+    def validate_assignment(self) -> Self:
+        assert self.k_of_c, "k_of_c must be non-empty"
+        assert min(self.k_of_c) >= 0, "k_of_c has a negative group index"
+        assert max(self.k_of_c) < self.n_groups, (
+            f"k_of_c has group index {max(self.k_of_c)} >= n_groups {self.n_groups}"
+        )
+        assert self.event_indicator == "p_anneal", "hard_concrete indicator is deferred to E5"
+        return self
+
+
 # Discriminated union (by `mode`) of every CI-fn config the trainer accepts. Pydantic
 # picks the right branch from the YAML `pd.ci_config.mode` literal.
-CiConfig = LayerwiseCiConfig | GlobalCiConfig | SpikeGatedCiConfig
+CiConfig = LayerwiseCiConfig | GlobalCiConfig | SpikeGatedCiConfig | HierarchicalCiConfig
 
 
 class MLPCiFn(nn.Module):
@@ -521,6 +574,99 @@ class SpikeGatedCiFn(nn.Module):
         return {name: split_outputs[i] for i, name in enumerate(self.layer_order)}
 
 
+class HierarchicalCiFn(nn.Module):
+    """Two-level hierarchical CI fn: composed gate `g_c = γ_{k(c)} · h_c`, no sampler.
+
+    Same dict-in/dict-out contract as `GlobalSharedMLPCiFn` so it sits behind `GlobalCiFnWrapper`
+    unchanged. A shared trunk maps the concatenated layer inputs to `K` group logits + `M` interior
+    logits; γ and h are each squashed by the leaky-hard sigmoids, γ is gathered to per-subcomponent
+    via the fixed `k_of_c` buffer, and the composed lower-leaky gate `g_low = γ_low[k(c)] · h_low`
+    ∈ [0,1] is returned (the downstream re-squash is then a no-op on the value; doc §2.1). Death
+    (below-0) revival gradients are carried by the internal `lower_leaky` on the γ/h logits.
+
+    Side effects consumed by `TwoPartCodeLoss` and the hier diagnostics: every forward caches the
+    group/interior gates (`_gamma_low/_gamma_up`, `_h_low/_h_up`), the composed gates
+    (`_g_low/_g_up`), the pre-sigmoid logits (`_gamma_pre/_h_pre`), and exposes `k_of_c`.
+    """
+
+    def __init__(
+        self,
+        layer_configs: dict[str, tuple[int, int]],  # layer_name -> (input_dim, C)
+        k_of_c: list[int],
+        n_groups: int,
+        trunk_hidden_dims: list[int],
+        h_init_bias: float,
+        gamma_init_scale: float,
+    ):
+        super().__init__()
+        self.layer_order = sorted(layer_configs.keys())
+        self.split_sizes = [layer_configs[name][1] for name in self.layer_order]
+        total_input_dim = sum(input_dim for input_dim, _ in layer_configs.values())
+        self.M = sum(C for _, C in layer_configs.values())
+        self.K = n_groups
+        assert len(k_of_c) == self.M, f"k_of_c length {len(k_of_c)} != C_total {self.M}"
+        self.register_buffer("k_of_c", torch.tensor(k_of_c, dtype=torch.long))
+
+        self.trunk = nn.Sequential()
+        for i in range(len(trunk_hidden_dims)):
+            in_dim = total_input_dim if i == 0 else trunk_hidden_dims[i - 1]
+            self.trunk.append(Linear(in_dim, trunk_hidden_dims[i], nonlinearity="relu"))
+            self.trunk.append(nn.GELU())
+        final_dim = trunk_hidden_dims[-1] if trunk_hidden_dims else total_input_dim
+        self.head = Linear(final_dim, self.K + self.M, nonlinearity="linear")
+        with torch.no_grad():
+            if gamma_init_scale != 1.0:
+                self.head.W[:, : self.K].mul_(gamma_init_scale)
+            # interior logit-head bias ⇒ h≈1 at init ⇒ g≈γ (group-level VPD start; doc §2.3)
+            self.head.b[self.K :].add_(h_init_bias)
+
+        self._gamma_pre: Tensor | None = None
+        self._h_pre: Tensor | None = None
+        self._gamma_low: Tensor | None = None
+        self._gamma_up: Tensor | None = None
+        self._h_low: Tensor | None = None
+        self._h_up: Tensor | None = None
+        self._g_low: Tensor | None = None
+        self._g_up: Tensor | None = None
+
+        # No sampler ⇒ the composed gate is already deterministic; kept for interface parity so the
+        # PGD adversary path (`gate_deterministic=True`) works unchanged.
+        self._force_deterministic_gate: bool = False
+
+    @contextmanager
+    def force_deterministic_gate(self) -> Iterator[None]:
+        """No-op — gates are already deterministic; present for interface parity with the spike path."""
+        yield
+
+    @override
+    def forward(
+        self,
+        input_acts: dict[str, Float[Tensor, "... d_in"]],
+    ) -> dict[str, Float[Tensor, "... C"]]:
+        concatenated = torch.cat([input_acts[name] for name in self.layer_order], dim=-1)
+        trunk_out = self.trunk(concatenated) if len(self.trunk) else concatenated
+        gamma_pre, h_pre = torch.split(self.head(trunk_out), [self.K, self.M], dim=-1)
+
+        gamma_low = lower_leaky_hard_sigmoid(gamma_pre)
+        gamma_up = upper_leaky_hard_sigmoid(gamma_pre)
+        h_low = lower_leaky_hard_sigmoid(h_pre)
+        h_up = upper_leaky_hard_sigmoid(h_pre)
+
+        assert isinstance(self.k_of_c, Tensor)
+        gamma_gathered_low = gamma_low[..., self.k_of_c]  # composition A @ γ, A ∈ {0,1}^{M×K}
+        gamma_gathered_up = gamma_up[..., self.k_of_c]
+        g_low = gamma_gathered_low * h_low  # ∈ [0,1] — returned (mask path)
+        g_up = gamma_gathered_up * h_up  # ≥ 0 — cached for penalties/diagnostics
+
+        self._gamma_pre, self._h_pre = gamma_pre, h_pre
+        self._gamma_low, self._gamma_up = gamma_low, gamma_up
+        self._h_low, self._h_up = h_low, h_up
+        self._g_low, self._g_up = g_low, g_up
+
+        split_outputs = torch.split(g_low, self.split_sizes, dim=-1)
+        return {name: split_outputs[i] for i, name in enumerate(self.layer_order)}
+
+
 @dataclass
 class TargetLayerConfig:
     """Per-target metadata consumed by `GlobalSharedTransformerCiFn`."""
@@ -671,7 +817,10 @@ class GlobalCiFnWrapper(nn.Module):
 
     def __init__(
         self,
-        global_ci_fn: GlobalSharedMLPCiFn | GlobalSharedTransformerCiFn | SpikeGatedCiFn,
+        global_ci_fn: GlobalSharedMLPCiFn
+        | GlobalSharedTransformerCiFn
+        | SpikeGatedCiFn
+        | HierarchicalCiFn,
         components: dict[str, Components],
     ):
         super().__init__()
@@ -810,6 +959,54 @@ def _maybe_spike_gated_ci_fn(ci_fn: nn.Module) -> "SpikeGatedCiFn | None":
     return inner if isinstance(inner, SpikeGatedCiFn) else None
 
 
+def _make_hierarchical_ci_fn(
+    target_model: nn.Module,
+    module_to_c: dict[str, int],
+    components: dict[str, Components],
+    ci_config: HierarchicalCiConfig,
+) -> HierarchicalCiFn:
+    layer_configs: dict[str, tuple[int, int]] = {}
+    for path, module_c in module_to_c.items():
+        target_module = target_model.get_submodule(path)
+        component = components[path]
+        if isinstance(target_module, nn.Embedding):
+            assert isinstance(component, EmbeddingComponents)
+            input_dim = component.C
+        else:
+            input_dim = get_module_input_dim(target_module)
+        layer_configs[path] = (input_dim, module_c)
+    c_total = sum(module_to_c.values())
+    assert len(ci_config.k_of_c) == c_total, (
+        f"k_of_c length {len(ci_config.k_of_c)} != C_total {c_total}"
+    )
+    return HierarchicalCiFn(
+        layer_configs=layer_configs,
+        k_of_c=ci_config.k_of_c,
+        n_groups=ci_config.n_groups,
+        trunk_hidden_dims=ci_config.trunk_hidden_dims,
+        h_init_bias=ci_config.h_init_bias,
+        gamma_init_scale=ci_config.gamma_init_scale,
+    )
+
+
+def get_hierarchical_ci_fn(ci_fn: nn.Module) -> HierarchicalCiFn:
+    """Return the inner `HierarchicalCiFn` from a `GlobalCiFnWrapper` (asserts the type).
+
+    Used by `TwoPartCodeLoss` + the hier diagnostics to reach the cached γ/h gates and `k_of_c`.
+    """
+    inner = getattr(ci_fn, "_global_ci_fn", None)
+    assert isinstance(inner, HierarchicalCiFn), (
+        "expected a hierarchical CI fn (set ci_config.mode='hierarchical')"
+    )
+    return inner
+
+
+def _maybe_hierarchical_ci_fn(ci_fn: nn.Module) -> "HierarchicalCiFn | None":
+    """The inner `HierarchicalCiFn` if `ci_fn` wraps one, else None (non-asserting)."""
+    inner = getattr(ci_fn, "_global_ci_fn", None)
+    return inner if isinstance(inner, HierarchicalCiFn) else None
+
+
 @contextmanager
 def maybe_force_deterministic_gate(ci_fn: nn.Module, enabled: bool) -> Iterator[None]:
     """Force the spike gate's deterministic branch when `enabled` and `ci_fn` is spike-gated.
@@ -876,3 +1073,11 @@ def make_ci_fn_wrapper(
                 ci_config=ci_config,
             )
             return GlobalCiFnWrapper(global_ci_fn=raw_spike, components=components)
+        case HierarchicalCiConfig():
+            raw_hier = _make_hierarchical_ci_fn(
+                target_model=target_model,
+                module_to_c=module_to_c,
+                components=components,
+                ci_config=ci_config,
+            )
+            return GlobalCiFnWrapper(global_ci_fn=raw_hier, components=components)
