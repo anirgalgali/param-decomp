@@ -572,6 +572,20 @@ class Trainer:
                     anneal(current_frac)
                     gate_temp = getattr(module, "temp", None)
 
+            # Opt-in per-step curriculum (no-op unless a hook is attached, e.g. via a `pre_run_hook`).
+            # Runs after the zero_grad above and before the forward/backward, so a `requires_grad`
+            # flip or an accumulated auxiliary backward lands on the same optimizer step.
+            curriculum_hook = getattr(self, "_curriculum_hook", None)
+            if curriculum_hook is not None:
+                curriculum_hook.on_step(
+                    step=step,
+                    current_frac=current_frac,
+                    component_model=self.component_model,
+                    components_optimizer=self.components_optimizer,
+                    ci_fn_optimizer=self.ci_fn_optimizer,
+                    loss_metrics=self.loss_metrics,
+                )
+
             batch_log_data: defaultdict[str, float] = defaultdict(float)
 
             # Compute weight_deltas OUTSIDE bf16_autocast so FaithfulnessLoss residuals are fp32
