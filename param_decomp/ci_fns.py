@@ -13,7 +13,6 @@ from jaxtyping import Float
 from pydantic import (
     Field,
     NonNegativeFloat,
-    NonNegativeInt,
     PositiveFloat,
     PositiveInt,
     model_validator,
@@ -22,7 +21,6 @@ from torch import Tensor, nn
 
 from param_decomp.base_config import BaseConfig, Probability
 from param_decomp.ci_nn_blocks import Linear, ParallelLinear, TransformerBlock
-from param_decomp.ci_sigmoids import lower_leaky_hard_sigmoid, upper_leaky_hard_sigmoid
 from param_decomp.components import Components, EmbeddingComponents, get_module_input_dim
 
 LayerwiseCiFnType = Literal["mlp", "vector_mlp", "shared_mlp"]
