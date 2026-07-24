@@ -1,15 +1,18 @@
-"""Two-part description-length loss (Term H) for the VPD-hier hierarchical CI.
+"""Two-part description-length loss (Term H) for the VPD-hier CI under the envelope parameterization.
 
-Prices the two-level code `g_c = γ_{k(c)} · h_c`: name each active group (κ_k = log2(1/f_k)), then
-specify its interior (Σ_{c∈k} ℓ(h_c; q_c)), all charged through the group event indicator |γ_k|^p:
+Prices the code `γ_k = noisy-OR_{c∈k}(g_c)` (no h head; Stage 2): name each active group
+(`κ_k = log2(1/f_k)`), then specify its interior with the conditional cross-entropy, written without
+materializing `h` (approach §1.4):
 
-    per_token_k = |γ_{k,t}|^p · ( κ_k + Σ_{c∈k} ℓ(h_{c,t}; q_c) )
+    per_token_k = γ_{k,t} κ_k + Σ_{c∈k} ( g_{c,t} log2(1/q_c) + (γ_{k,t} − g_{c,t}) log2(1/(1−q_c)) )
     loss        = mean_t Σ_k per_token_k
 
-`γ_up`/`h_up` (the upper-leaky group/interior gates) are read off the `HierarchicalCiFn` cache each
-forward. Batch statistics `f_k` (group frequency) and `q_c` (P(interior on | group on)) are held as
-detached EMA buffers and stop-gradded (envelope-theorem correction, doc §6.6): gradients flow through
-the live `γ_{k,t}`, `h_{c,t}` but not through `κ_k`, `q_c`. See `docs/hier_ci_implementation_plan.md`.
+The pooled `γ` (`_gamma_low`) and the raw gates `g` (`_g_low`) are read off the `HierarchicalCiFn`
+cache each forward — both bounded in [0,1], so every term is ≥ 0. Batch statistics `f_k` (group
+frequency) and `q_c` (P(member on | group on)) are held as detached EMA buffers and stop-gradded
+(envelope-theorem correction): gradients flow through the live `γ`, `g` (and thence, via the noisy-OR
+pool, the raw gates) but not through `κ_k`, `q_c`. No `|γ|^p` event weighting — the p-anneal lives on
+Term F only. See `docs/learning_the_assignment_matrix_A.md` §1.4 and `docs/stage2_learning_assignment_plan.md` §2.2.
 """
 
 from typing import Any, Literal, override
@@ -25,67 +28,71 @@ from param_decomp.ci_fns import get_hierarchical_ci_fn
 from param_decomp.distributed import all_reduce
 from param_decomp.metrics.base import LossMetricConfig, Metric, MetricResult
 from param_decomp.metrics.context import MetricContext
-from param_decomp.metrics.importance_minimality import _get_linear_annealed_p
 
 LOG2 = 0.6931471805599453  # ln 2, to convert torch.log → log2 without repeated tensor allocs
 
 
 def batch_stats(
     gamma: Float[Tensor, "N K"],
-    h: Float[Tensor, "N M"],
+    g: Float[Tensor, "N M"],
     k_of_c: Tensor,
     *,
     eps: float,
 ) -> tuple[Float[Tensor, " K"], Float[Tensor, " M"]]:
-    """Group frequency `f_k = mean_t γ_k` and γ-weighted interior stat `q_c = Σ_t γ_{k(c)}h_c / Σ_t γ_{k(c)}`."""
+    """Group frequency `f_k = mean_t γ_k` and conditional member rate `q_c = Σ_t g_c / Σ_t γ_{k(c)}`."""
     f = gamma.mean(0)
     group_mass = gamma.sum(0).clamp(min=eps)
-    q = (gamma[:, k_of_c] * h).sum(0) / group_mass[k_of_c]
+    q = g.sum(0) / group_mass[k_of_c]
     return f, q
 
 
 def two_part_code_cost(
     gamma: Float[Tensor, "N K"],
-    h: Float[Tensor, "N M"],
+    g: Float[Tensor, "N M"],
     k_of_c: Tensor,
     *,
     kappa: Float[Tensor, " K"],
     q: Float[Tensor, " M"],
-    p: float,
     interior_code: str,
     naming_form: str,
-    eps: float,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Per-token two-part DL `mean_t Σ_k |γ_k|^p (κ_k + Σ_{c∈k} ℓ(h_c;q_c))`, returned as
-    `(loss, naming_component, interior_component)`. `kappa`, `q` are the (detached) code statistics;
-    gradients flow only through the live `gamma`, `h`."""
+    """Per-token envelope-form two-part DL, returned as `(loss, naming_component, interior_component)`:
+
+        Σ_k [ γ_k κ_k + Σ_{c∈k} ( g_c log2(1/q_c) + (γ_{k(c)} − g_c) log2(1/(1−q_c)) ) ]
+
+    (`on_only` drops the second interior piece.) `kappa`, `q` are the (detached) code statistics;
+    gradients flow only through the live `gamma`, `g`. All quantities are in [0,1] ⇒ every term ≥ 0."""
     log2_inv_q = -torch.log(q) / LOG2
     log2_inv_1mq = -torch.log1p(-q) / LOG2
+    gamma_gathered = gamma[:, k_of_c]  # [N, M] — γ_{k(c)} per member
     if interior_code == "complete":
-        ell = h * log2_inv_q + (1.0 - h) * log2_inv_1mq  # protects nesting; ratchets at q>½
+        off = (gamma_gathered - g).clamp(
+            min=0.0
+        )  # ≥ 0 (envelope); clamp guards the noisy-OR δ-slack
+        ell = g * log2_inv_q + off * log2_inv_1mq  # protects nesting; ratchets at q>½
     else:
-        ell = h * log2_inv_q  # on_only — monotone downward, no flip
+        ell = g * log2_inv_q  # on_only — monotone downward, no flip
     interior_per_group = torch.zeros_like(gamma)
     interior_per_group.index_add_(1, k_of_c, ell)
     if naming_form == "surprisal":
         naming = kappa.unsqueeze(0)  # [1, K] detached
-    else:  # count: log2(1 + Σ_t |γ_k|^p) — grad-carrying (§7.2)
-        naming = torch.log1p(((gamma + eps) ** p).sum(0)).unsqueeze(0) / LOG2
-    gamma_pow = (gamma + eps) ** p  # event indicator |γ|^p
-    naming_c = (gamma_pow * naming).sum(1).mean(0)
-    interior_c = (gamma_pow * interior_per_group).sum(1).mean(0)
+    else:  # count: log2(1 + Σ_t γ_k) — grad-carrying (§7.2)
+        naming = torch.log1p(gamma.sum(0)).unsqueeze(0) / LOG2
+    naming_c = (gamma * naming).sum(1).mean(0)
+    interior_c = interior_per_group.sum(1).mean(0)
     return naming_c + interior_c, naming_c, interior_c
 
 
 class TwoPartCodeLossConfig(LossMetricConfig):
-    """Config for the two-part description-length loss (Term H).
+    """Config for the two-part description-length loss (Term H), envelope form.
 
-    `interior_code`: `complete` = `h·log2(1/q)+(1-h)·log2(1/(1-q))` (protects nesting; ratchets at
-    q>½); `on_only` = `h·log2(1/q)` (monotone downward, no flip). `naming_form`: `surprisal` = the
-    detached `κ_k = log2(1/f_k)` (§4.9 recipe); `count` = `log2(1 + Σ_t |γ_k|^p)` (grad-carrying, the
+    `interior_code`: `complete` = `g·log2(1/q)+(γ−g)·log2(1/(1−q))` (protects nesting; ratchets at
+    q>½); `on_only` = `g·log2(1/q)` (monotone downward, no flip — the E5 ablation). `naming_form`:
+    `surprisal` = the detached `κ_k = log2(1/f_k)`; `count` = `log2(1 + Σ_t γ_k)` (grad-carrying, the
     §7.2 pressure variant). `eps_floor` floors `f_k` and lower-clamps `q_c` (anti-death); `eps_ceil`
-    upper-clamps `q_c` (ratchet ceiling `log2((1-ε)/ε)`). The p-anneal fields mirror Term F so the two
-    share the same event-indicator homotopy (`p_shared_with_termF` documents that intent).
+    upper-clamps `q_c` — together they set the conformity cap `log2((1−ε_ceil)/ε_ceil)` that the
+    `β_F/β_H` no-capture floor is derived against (approach §1.6). No p-anneal here — the homotopy
+    lives on Term F only (approach §1.4).
     """
 
     type: Literal["TwoPartCodeLoss"] = "TwoPartCodeLoss"
@@ -96,16 +103,11 @@ class TwoPartCodeLossConfig(LossMetricConfig):
     ema_momentum: Probability = 0.99
     warmup_end_frac: Probability = 0.1
     warmup_end_steps: NonNegativeInt = 0
-    pnorm: NonNegativeFloat = 2.0
-    p_anneal_start_frac: Probability = 0.0
-    p_anneal_final_p: NonNegativeFloat | None = 0.4
-    p_anneal_end_frac: Probability = 0.8
-    p_shared_with_termF: bool = True
     eps: NonNegativeFloat = 1e-12
 
 
 class TwoPartCodeLoss(Metric[TwoPartCodeLossConfig]):
-    """Two-part DL (Term H) on the hierarchical composed gate. Detached EMA batch stats."""
+    """Two-part DL (Term H) on the derived noisy-OR group gate. Detached EMA batch stats."""
 
     log_namespace = "loss"
     short_name = "TwoPartDL"
@@ -133,22 +135,21 @@ class TwoPartCodeLoss(Metric[TwoPartCodeLossConfig]):
     @override
     def update(self, ctx: MetricContext) -> Tensor:
         fn = get_hierarchical_ci_fn(ctx.model.ci_fn)
-        assert fn._gamma_up is not None and fn._gamma_low is not None and fn._h_low is not None, (
+        assert fn._gamma_low is not None and fn._g_low is not None, (
             "CI fn forward must run before TwoPartCodeLoss.update"
         )
         assert isinstance(fn.k_of_c, Tensor)
-        # Event indicator |γ|^p uses the upper-leaky γ (the above-1 leak is legitimate downward
-        # pressure on saturated groups). The interior CHARGE and the code STATISTICS use the bounded
-        # lower-leaky gates: ℓ(h;q) and κ=log2(1/f) are code lengths, only defined for gates in [0,1].
-        # (Charging the interior on the unbounded h_up lets the q>½ ratchet drive h→∞, sending the DL
-        # to −∞ and flipping the γ pressure to inflation — the collapse seen in the first E1 run.)
-        gamma_up = fn._gamma_up.reshape(-1, fn.K).float()  # [N, K] event indicator
-        gamma_low = fn._gamma_low.reshape(-1, fn.K).float()  # [N, K] bounded gate (stats)
-        h_low = fn._h_low.reshape(-1, fn.M).float()  # [N, M] bounded interior gate
+        # The loss reads the bounded lower-leaky gates: the pooled group gate γ and the raw gates g.
+        # Both ∈ [0,1] ⇒ κ = log2(1/f) and the interior conditional cross-entropy are well-defined code
+        # lengths and every term is ≥ 0. Gradients flow through g directly and through γ = noisy-OR(g)
+        # (routing ∂/∂g_c the pool sensitivity D_c; approach §1.5). There is no separate event
+        # indicator — the |γ|^p weighting is dropped (approach §1.4); the p-anneal lives on Term F.
+        gamma = fn._gamma_low.reshape(-1, fn.K).float()  # [N, K] pooled group gate
+        g = fn._g_low.reshape(-1, fn.M).float()  # [N, M] raw gate (= composed CI)
 
-        # Detached EMA code statistics (stop-grad; doc §6.6).
+        # Detached EMA code statistics (stop-grad; envelope theorem).
         with torch.no_grad():
-            f_batch, q_batch = batch_stats(gamma_low, h_low, fn.k_of_c, eps=self.cfg.eps)
+            f_batch, q_batch = batch_stats(gamma, g, fn.k_of_c, eps=self.cfg.eps)
             self._update_ema(f_batch, q_batch)
             assert self._f_ema is not None and self._q_ema is not None
             f = self._f_ema.clamp(min=self.cfg.eps_floor)
@@ -156,15 +157,13 @@ class TwoPartCodeLoss(Metric[TwoPartCodeLossConfig]):
             kappa = -torch.log(f) / LOG2  # [K] = log2(1/f)
 
         loss, naming_c, interior_c = two_part_code_cost(
-            gamma_up,
-            h_low,
+            gamma,
+            g,
             fn.k_of_c,
             kappa=kappa,
             q=q,
-            p=self._annealed_p(ctx),
             interior_code=self.cfg.interior_code,
             naming_form=self.cfg.naming_form,
-            eps=self.cfg.eps,
         )
         loss = self._warmup(ctx) * loss
 
@@ -173,15 +172,6 @@ class TwoPartCodeLoss(Metric[TwoPartCodeLossConfig]):
         self.sum_interior += interior_c.detach()
         self.n_batches += 1
         return loss
-
-    def _annealed_p(self, ctx: MetricContext) -> float:
-        return _get_linear_annealed_p(
-            current_frac_of_training=ctx.current_frac_of_training,
-            initial_p=self.cfg.pnorm,
-            p_anneal_start_frac=self.cfg.p_anneal_start_frac,
-            p_anneal_final_p=self.cfg.p_anneal_final_p,
-            p_anneal_end_frac=self.cfg.p_anneal_end_frac,
-        )
 
     def _warmup(self, ctx: MetricContext) -> float:
         assert not (self.cfg.warmup_end_frac > 0.0 and self.cfg.warmup_end_steps > 0), (

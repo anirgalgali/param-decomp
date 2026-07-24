@@ -205,16 +205,19 @@ class SpikeGatedCiConfig(BaseConfig):
 
 
 class HierarchicalCiConfig(BaseConfig):
-    """VPD-hier two-level causal importance `g_c = γ_{k(c)} · h_c` (group × interior gate), tied by a
-    fixed input-independent assignment `k(c)`. A shared trunk emits `K` group logits + `M` interior
-    logits; the composed gate `g ∈ [0,1]` is returned per layer. No sampler — gates stay deterministic
-    (VPD's leaky-hard sigmoids). Priced by `TwoPartCodeLoss`; see `docs/hier_ci_implementation_plan.md`.
+    """VPD-hier causal importance under the *envelope parameterization* (Stage 2). The CI network is
+    identical to standard VPD: it emits `M` raw gates `g_c ∈ [0,1]` through leaky-hard sigmoids — no γ
+    head, no h head. The group gate is the *derived* noisy-OR pool `γ_k = 1 − Π_{c∈S_k}(1 − g_c)` over
+    the fixed assignment `k(c)`, so `K` never enters the network and the online mover can rewrite
+    `k_of_c`/`n_groups` in place. Priced by `TwoPartCodeLoss`; see
+    `docs/learning_the_assignment_matrix_A.md` §1 and `docs/stage2_learning_assignment_plan.md` §2.
     """
 
     mode: Literal["hierarchical"] = "hierarchical"
     n_groups: PositiveInt = Field(
         ...,
-        description="Total group gates K = real groups + bottleneck group(s) + dead singletons.",
+        description="Number of group slots K = real groups + bottleneck group(s) + dead singletons. "
+        "K is not a network dimension — γ is pooled from the raw gates by k_of_c.",
     )
     k_of_c: list[NonNegativeInt] = Field(
         ...,
@@ -224,18 +227,9 @@ class HierarchicalCiConfig(BaseConfig):
     trunk_hidden_dims: list[PositiveInt] = Field(
         ..., description="Hidden dims of the shared trunk (empty list ⇒ a linear trunk)."
     )
-    h_init_bias: float = Field(
-        default=4.0,
-        description="Positive bias added to the interior (h) logit head at init ⇒ h≈1 at step 0, so "
-        "g≈γ (the system starts as group-level VPD; doc §2.3).",
-    )
-    gamma_init_scale: PositiveFloat = Field(
-        default=1.0, description="Multiplier on the group (γ) logit-head output columns after init."
-    )
     event_indicator: Literal["p_anneal", "hard_concrete"] = Field(
         default="p_anneal",
-        description="Event indicator shared with Terms F/H: `p_anneal` = |·|^p homotopy (E1 default); "
-        "`hard_concrete` = Louizos atom probability of the pre-sigmoid logit (E5; not yet wired).",
+        description="Reserved for parity with the other CI configs; `hard_concrete` is deferred (E5).",
     )
 
     @model_validator(mode="after")
@@ -577,19 +571,25 @@ class SpikeGatedCiFn(nn.Module):
         return {name: split_outputs[i] for i, name in enumerate(self.layer_order)}
 
 
+NOISY_OR_CLAMP = (
+    1e-6  # floor on (1 − g_c) so the log-space noisy-OR stays finite at saturated gates
+)
+
+
 class HierarchicalCiFn(nn.Module):
-    """Two-level hierarchical CI fn: composed gate `g_c = γ_{k(c)} · h_c`, no sampler.
+    """Envelope-parameterized hierarchical CI fn (Stage 2): no γ head, no h head, no sampler.
 
-    Same dict-in/dict-out contract as `GlobalSharedMLPCiFn` so it sits behind `GlobalCiFnWrapper`
-    unchanged. A shared trunk maps the concatenated layer inputs to `K` group logits + `M` interior
-    logits; γ and h are each squashed by the leaky-hard sigmoids, γ is gathered to per-subcomponent
-    via the fixed `k_of_c` buffer, and the composed lower-leaky gate `g_low = γ_low[k(c)] · h_low`
-    ∈ [0,1] is returned (the downstream re-squash is then a no-op on the value; doc §2.1). Death
-    (below-0) revival gradients are carried by the internal `lower_leaky` on the γ/h logits.
+    The trunk+head is identical to standard VPD — it emits `M` raw gates `g_c ∈ [0,1]` (leaky-hard
+    sigmoids). The group gate is the *derived* noisy-OR pool `γ_k = 1 − Π_{c∈S_k}(1 − g_c)` over the
+    fixed `k_of_c` buffer, so `γ ∈ [max_c g_c, 1]` by construction (the Term-H `(γ − g_c)` term stays
+    nonnegative and the code stays bounded) and `K` never enters the network — the online mover can
+    rewrite `k_of_c`/`n_groups` in place with no head resize. noisy-OR is the exact soft relaxation of
+    the OR-union the discrete scorer computes on bitsets. The raw gate *is* the composed causal
+    importance and is returned per layer (same dict contract as `GlobalSharedMLPCiFn`); the downstream
+    re-squash is a no-op on [0,1]. Death (below-0) revival gradients are carried by `lower_leaky`.
 
-    Side effects consumed by `TwoPartCodeLoss` and the hier diagnostics: every forward caches the
-    group/interior gates (`_gamma_low/_gamma_up`, `_h_low/_h_up`), the composed gates
-    (`_g_low/_g_up`), the pre-sigmoid logits (`_gamma_pre/_h_pre`), and exposes `k_of_c`.
+    Side effects consumed by `TwoPartCodeLoss` and the hier diagnostics: every forward caches the raw
+    gates (`_g_pre`, `_g_low`, `_g_up`) and the pooled group gate (`_gamma_low`), and exposes `k_of_c`.
     """
 
     def __init__(
@@ -598,8 +598,6 @@ class HierarchicalCiFn(nn.Module):
         k_of_c: list[int],
         n_groups: int,
         trunk_hidden_dims: list[int],
-        h_init_bias: float,
-        gamma_init_scale: float,
     ):
         super().__init__()
         self.layer_order = sorted(layer_configs.keys())
@@ -616,30 +614,34 @@ class HierarchicalCiFn(nn.Module):
             self.trunk.append(Linear(in_dim, trunk_hidden_dims[i], nonlinearity="relu"))
             self.trunk.append(nn.GELU())
         final_dim = trunk_hidden_dims[-1] if trunk_hidden_dims else total_input_dim
-        self.head = Linear(final_dim, self.K + self.M, nonlinearity="linear")
-        with torch.no_grad():
-            if gamma_init_scale != 1.0:
-                self.head.W[:, : self.K].mul_(gamma_init_scale)
-            # interior logit-head bias ⇒ h≈1 at init ⇒ g≈γ (group-level VPD start; doc §2.3)
-            self.head.b[self.K :].add_(h_init_bias)
+        self.head = Linear(final_dim, self.M, nonlinearity="linear")
 
-        self._gamma_pre: Tensor | None = None
-        self._h_pre: Tensor | None = None
-        self._gamma_low: Tensor | None = None
-        self._gamma_up: Tensor | None = None
-        self._h_low: Tensor | None = None
-        self._h_up: Tensor | None = None
+        self._g_pre: Tensor | None = None
         self._g_low: Tensor | None = None
         self._g_up: Tensor | None = None
+        self._gamma_low: Tensor | None = None
 
-        # No sampler ⇒ the composed gate is already deterministic; kept for interface parity so the
-        # PGD adversary path (`gate_deterministic=True`) works unchanged.
+        # No sampler ⇒ the gate is already deterministic; kept for interface parity so the PGD
+        # adversary path (`gate_deterministic=True`) works unchanged.
         self._force_deterministic_gate: bool = False
 
     @contextmanager
     def force_deterministic_gate(self) -> Iterator[None]:
         """No-op — gates are already deterministic; present for interface parity with the spike path."""
         yield
+
+    def _pool_noisy_or(self, g: Float[Tensor, "... M"]) -> Float[Tensor, "... K"]:
+        """`γ_k = 1 − Π_{c∈S_k}(1 − g_c)` in log-space over the `k_of_c` groups.
+
+        `∂γ_k/∂g_c = Π_{c'≠c}(1 − g_{c'}) = D_c` (approach §1.5) is delivered automatically by autograd.
+        The clamp on `(1 − g_c)` keeps the log finite at saturated gates (`g_c = 1`), making `γ = 1`
+        a supremum rather than an attained value — the §1.6 β-floor is unaffected.
+        """
+        assert isinstance(self.k_of_c, Tensor)
+        log_one_minus = torch.log((1.0 - g).clamp(min=NOISY_OR_CLAMP))
+        log_prod = torch.zeros(*g.shape[:-1], self.K, device=g.device, dtype=g.dtype)
+        log_prod.index_add_(-1, self.k_of_c, log_one_minus)
+        return 1.0 - torch.exp(log_prod)
 
     @override
     def forward(
@@ -648,23 +650,15 @@ class HierarchicalCiFn(nn.Module):
     ) -> dict[str, Float[Tensor, "... C"]]:
         concatenated = torch.cat([input_acts[name] for name in self.layer_order], dim=-1)
         trunk_out = self.trunk(concatenated) if len(self.trunk) else concatenated
-        gamma_pre, h_pre = torch.split(self.head(trunk_out), [self.K, self.M], dim=-1)
+        g_pre = self.head(trunk_out)
 
-        gamma_low = lower_leaky_hard_sigmoid(gamma_pre)
-        gamma_up = upper_leaky_hard_sigmoid(gamma_pre)
-        h_low = lower_leaky_hard_sigmoid(h_pre)
-        h_up = upper_leaky_hard_sigmoid(h_pre)
+        g_low = lower_leaky_hard_sigmoid(g_pre)  # ∈ [0,1] — the composed CI (mask path + loss)
+        g_up = upper_leaky_hard_sigmoid(g_pre)  # ≥ 0 — above-1 leak, cached for parity/diagnostics
+        gamma_low = self._pool_noisy_or(g_low)  # derived group gate ∈ [max_c g_c, 1]
 
-        assert isinstance(self.k_of_c, Tensor)
-        gamma_gathered_low = gamma_low[..., self.k_of_c]  # composition A @ γ, A ∈ {0,1}^{M×K}
-        gamma_gathered_up = gamma_up[..., self.k_of_c]
-        g_low = gamma_gathered_low * h_low  # ∈ [0,1] — returned (mask path)
-        g_up = gamma_gathered_up * h_up  # ≥ 0 — cached for penalties/diagnostics
-
-        self._gamma_pre, self._h_pre = gamma_pre, h_pre
-        self._gamma_low, self._gamma_up = gamma_low, gamma_up
-        self._h_low, self._h_up = h_low, h_up
+        self._g_pre = g_pre
         self._g_low, self._g_up = g_low, g_up
+        self._gamma_low = gamma_low
 
         split_outputs = torch.split(g_low, self.split_sizes, dim=-1)
         return {name: split_outputs[i] for i, name in enumerate(self.layer_order)}
@@ -987,8 +981,6 @@ def _make_hierarchical_ci_fn(
         k_of_c=ci_config.k_of_c,
         n_groups=ci_config.n_groups,
         trunk_hidden_dims=ci_config.trunk_hidden_dims,
-        h_init_bias=ci_config.h_init_bias,
-        gamma_init_scale=ci_config.gamma_init_scale,
     )
 
 
