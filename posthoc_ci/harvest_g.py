@@ -100,7 +100,7 @@ def main() -> None:
     it = iter(loader)
     for shard_idx in range(n_shards):
         batch = move_batch_to_device(next(it), device)
-        token_ids = batch["input_ids"]
+        token_ids = batch if isinstance(batch, torch.Tensor) else batch["input_ids"]
         assert token_ids.shape == (BATCH_SEQS, seq_len), token_ids.shape
 
         with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=autocast):
