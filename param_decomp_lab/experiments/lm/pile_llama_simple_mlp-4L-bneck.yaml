@@ -111,8 +111,11 @@ pd:
       coeff: 10000000.0
 cadence:
   train_log_every: 200
-  save_every: 5000
-  keep_last_n_checkpoints: 2
+  # Pruning deletes checkpoints from W&B as well as disk, so a pruned step is gone for good.
+  # 10k/20k/30k/40k spans the post-warmup sparsification (the price is only at full strength
+  # from step 8000), which is what the bottleneck_interp pipeline needs to see a trajectory.
+  save_every: 10000
+  keep_last_n_checkpoints: 4
 eval:
   n_steps: 1
   batch_size: 128
@@ -146,8 +149,10 @@ eval:
       n_steps: 20
       mask_scope: shared_across_batch
     - type: BottleneckCodeStats
+    # Self-caps at eval.n_steps (1), so any value above 1 is dead. Raise eval.batch_size, not
+    # this, if the histogram needs more code samples.
     - type: BottleneckCodeHistograms
-      n_batches_accum: 4
+      n_batches_accum: 1
 target:
   spec:
     kind: pretrained
