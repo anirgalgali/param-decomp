@@ -66,6 +66,32 @@ def solve_codes(
     return z.clamp_min_(0.0)
 
 
+def solve_covering(
+    g: torch.Tensor,
+    b: torch.Tensor,
+    n_steps: int = 200,
+    eps: float = 0.01,
+    lam: float = 100.0,
+) -> tuple[torch.Tensor, float]:
+    """Coverage-constrained codes (amendment 4): min sum(z) s.t. z >= 0, Bz >= g - eps.
+
+    Hinge-penalty projected gradient (exactness not required — the residual violation
+    is returned and reported). Isolates the false-positive-only regime: these codes
+    never under-predict beyond eps except where reported.
+    """
+    lr = 1.0 / max(_spectral_norm_sq(b), 1e-8) / lam
+    col_sq = (b * b).sum(dim=0).clamp_min(1e-8)
+    z = ((g @ b) / col_sq).clamp_min_(0.0) * 2.0  # start generous
+    ones = torch.ones_like(z)
+    for _ in range(n_steps):
+        deficit = (g - eps - (z @ b.T)).clamp_min(0.0)
+        grad = ones - 2.0 * lam * (deficit @ b)
+        z = (z - lr * grad).clamp_min_(0.0)
+    final_deficit = (g - eps - (z @ b.T)).clamp_min(0.0)
+    violation = float(final_deficit.sum(dim=-1).mean().item())
+    return z, violation
+
+
 @dataclass
 class FitConfig:
     k: int
