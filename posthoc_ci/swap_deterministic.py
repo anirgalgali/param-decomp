@@ -55,6 +55,8 @@ def _condition_ci(run, ci_true, b, cond):
         return swap_lib.ghat_dict(run, ci_true, b)[0]  # b already shuffled by caller
     if cond == "binarized":
         return swap_lib.ghat_dict(run, ci_true, b, binarize_at=constants.TAU_EVAL)[0]
+    if cond == "covering":
+        return swap_lib.ghat_dict(run, ci_true, b, covering=True)[0]
     raise ValueError(cond)
 
 
@@ -80,7 +82,7 @@ def main() -> None:
     def load_b(cond):
         if cond == "g":
             return None
-        arm = "sym" if cond in ("sym", "shuffled", "binarized") else cond
+        arm = "sym" if cond in ("sym", "shuffled", "binarized", "covering") else cond
         b = torch.from_numpy(
             np.load(paths.fit_dir(args.k, args.seed, arm) / "final.npz")["B"]
         ).to(run.device)

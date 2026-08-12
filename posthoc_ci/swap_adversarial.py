@@ -36,7 +36,7 @@ def main() -> None:
     def load_b(cond):
         if cond == "g":
             return None
-        arm = "sym" if cond in ("sym", "shuffled", "binarized") else cond
+        arm = "sym" if cond in ("sym", "shuffled", "binarized", "covering") else cond
         b = torch.from_numpy(
             np.load(paths.fit_dir(args.k, args.seed, arm) / "final.npz")["B"]
         ).to(run.device)
@@ -63,8 +63,12 @@ def main() -> None:
             elif cond.startswith("asym"):
                 ci = swap_lib.ghat_dict(run, ci_true, load_b(cond),
                                         w_fn=float(cond.removeprefix("asym")))[0]
-            else:
+            elif cond == "covering":
+                ci = swap_lib.ghat_dict(run, ci_true, load_b(cond), covering=True)[0]
+            elif cond in ("sym", "shuffled"):
                 ci = swap_lib.ghat_dict(run, ci_true, load_b(cond))[0]
+            else:
+                raise ValueError(cond)
             floors_l0[cond] += swap_lib.induced_l0(run, ci, constants.TAU_STORE) * n_pos
             ci_by_cond[cond].append({k: v.to(torch.float16).cpu() for k, v in ci.items()})
 
