@@ -57,8 +57,9 @@ def main() -> None:
         h_flat = swap_lib.ci_dict_to_flat(run, gh)
         dropped = (g_flat > constants.TAU_EVAL) & (h_flat < constants.TAU_EVAL)
         dropped_count[mb] = dropped.sum(-1).cpu().numpy()
-        g_store.append(g_flat.to(torch.float16).cpu())
-        ghat_store.append(h_flat.to(torch.float16).cpu())
+        n_atoms = g_flat.shape[-1]
+        g_store.append(g_flat.reshape(-1, n_atoms).to(torch.float16).cpu())
+        ghat_store.append(h_flat.reshape(-1, n_atoms).to(torch.float16).cpu())
 
         d = 0
         for s in constants.SEEDS:
