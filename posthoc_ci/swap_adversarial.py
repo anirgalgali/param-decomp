@@ -76,20 +76,14 @@ def main() -> None:
     for cond in conditions:
         results[cond] = {"floors_l0_at_tau_store": floors_l0[cond] / n_pos_total}
         for n_steps in step_counts:
-            ci_gpu = [
-                {k: v.to(run.device, torch.float32) for k, v in mb_ci.items()}
-                for mb_ci in ci_by_cond[cond]
-            ]
-            tgt_gpu = [t.to(run.device, torch.float32) for t in target_per_mb]
             kl = swap_lib.pgd_shared_kl(
-                run, ci_gpu, tgt_gpu,
+                run, ci_by_cond[cond], target_per_mb,  # CPU fp16; streamed per micro-batch
                 n_steps=n_steps,
                 step_size=constants.PGD_STEP_SIZE,
                 seed=constants.RNG_BASE_KEY + n_steps,
             )
             results[cond][f"adv_kl_{n_steps}steps"] = kl
             print(f"{cond} @ {n_steps} steps: KL {kl:.4f}")
-            del ci_gpu, tgt_gpu
             torch.cuda.empty_cache()
 
     if "g" in results:

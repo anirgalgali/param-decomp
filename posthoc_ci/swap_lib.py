@@ -209,6 +209,10 @@ def pgd_shared_kl(
     Equivalent to the stock `shared_across_batch` protocol: per step, grad of the mean
     KL over the whole batch = weighted mean of micro-batch grads. Sources include the
     Δ column (mask_c = C + 1), exactly as `_init_adv_sources` builds them.
+
+    `ci_per_mb` / `target_per_mb` may live on CPU (fp16): each micro-batch is streamed
+    to the device per forward — the full eval batch's floors + target logits do NOT fit
+    on a 32GB card alongside the PGD graph.
     """
     device = run.device
     torch.manual_seed(seed)
@@ -222,16 +226,19 @@ def pgd_shared_kl(
     def forward_mb(i: int, mb: slice) -> torch.Tensor:
         tokens_mb = run.tokens[mb]
         lead = tokens_mb.shape
+        ci_mb = {k: v.to(device, torch.float32, non_blocking=True)
+                 for k, v in ci_per_mb[i].items()}
+        target_mb = target_per_mb[i].to(device, torch.float32, non_blocking=True)
         expanded = {k: v.expand(*lead, -1) for k, v in sources.items()}
         comp_sources = {k: v[..., :-1] for k, v in expanded.items()}
         wdm = {k: (run.weight_deltas[k], expanded[k][..., -1]) for k in run.weight_deltas}
         infos = make_mask_infos(
-            component_masks=interpolate_component_mask(ci_per_mb[i], comp_sources),
+            component_masks=interpolate_component_mask(ci_mb, comp_sources),
             weight_deltas_and_masks=wdm,
         )
         with torch.autocast("cuda", torch.bfloat16, enabled=run.autocast):
             logits = run.model(tokens_mb, mask_infos=infos)
-        sum_kl, _ = recon_loss_kl(pred=logits.float(), target=target_per_mb[i])
+        sum_kl, _ = recon_loss_kl(pred=logits.float(), target=target_mb)
         return sum_kl
 
     for _ in range(n_steps):
