@@ -42,28 +42,33 @@ def solve_codes(
     n_steps: int,
     w_fn: float = 1.0,
     lambda_z: float = 0.0,
+    signed_z: bool = False,
 ) -> torch.Tensor:
-    """argmin_{z>=0} sum w * (g - clip(z B^T))^2 + lambda_z ||z||_1, per row of `g`.
+    """argmin_z sum w * (g - clip(z B^T))^2 + lambda_z ||z||_1, per row of `g`.
 
-    g: [T, A], b: [A, K] (frozen). Returns z: [T, K]. Manual projected gradient with a
-    1/L step from the spectral norm of B — no autograd, cheap enough to call inside the
-    alternating fit every batch.
+    g: [T, A], b: [A, K] (frozen). Returns z: [T, K]. Manual FISTA with a 1/L step from
+    the spectral norm of B. z is constrained >= 0 unless `signed_z` (then plain
+    accelerated gradient — the in-loop bottleneck's code family, amendment: Rung 1S).
     """
     lr = 1.0 / max(_spectral_norm_sq(b), 1e-8)
     col_sq = (b * b).sum(dim=0).clamp_min(1e-8)
-    z = ((g @ b) / col_sq).clamp_min_(0.0)
+    z = (g @ b) / col_sq
+    if not signed_z:
+        z = z.clamp_min_(0.0)
     y = z.clone()
     t = 1.0
-    for _ in range(n_steps):  # FISTA (accelerated projected gradient)
+    for _ in range(n_steps):  # FISTA (accelerated [projected] gradient)
         bz = y @ b.T
         ghat = bz.clamp(0.0, 1.0)
         w = _loss_weights(g, ghat, w_fn)
-        grad = 2.0 * ((w * (ghat - g)) @ b) + lambda_z
-        z_next = (y - lr * grad).clamp_min_(0.0)
+        grad = 2.0 * ((w * (ghat - g)) @ b) + lambda_z * torch.sign(y)
+        z_next = y - lr * grad
+        if not signed_z:
+            z_next = z_next.clamp_min_(0.0)
         t_next = (1.0 + (1.0 + 4.0 * t * t) ** 0.5) / 2.0
         y = z_next + ((t - 1.0) / t_next) * (z_next - z)
         z, t = z_next, t_next
-    return z.clamp_min_(0.0)
+    return z if signed_z else z.clamp_min_(0.0)
 
 
 def solve_covering(
@@ -103,13 +108,23 @@ class FitConfig:
     lr_b: float = 1e-2
     b_steps_per_batch: int = 4
     no_clip: bool = False  # ablation: plain bilinear objective
+    signed_b: bool = False  # Rung 1S: allow inhibitory pattern entries
+    signed_z: bool = False  # Rung 1S: the in-loop (DoubleSidedJumpReLU) code family
 
 
-def init_b(g_sample: torch.Tensor, k: int, seed: int) -> torch.Tensor:
-    """Exemplar init: K random data rows as columns of B (seed-varied), floored at 0."""
+def init_b(g_sample: torch.Tensor, k: int, seed: int, signed: bool = False) -> torch.Tensor:
+    """Exemplar init: K random data rows as columns of B (seed-varied), floored at 0.
+
+    The exemplar rows are nonnegative by construction, which works for both modes
+    (Harry's `proto` init did the same); signed mode adds zero-mean instead of
+    positive jitter so cancellation directions are reachable from the start.
+    """
     gen = torch.Generator(device=g_sample.device).manual_seed(seed)
     rows = torch.randint(0, g_sample.shape[0], (k,), generator=gen, device=g_sample.device)
     b = g_sample[rows].T.clone()
+    if signed:
+        b += 0.01 * torch.randn(b.shape, generator=gen, device=g_sample.device)
+        return b
     b += 0.01 * torch.rand(b.shape, generator=gen, device=g_sample.device)
     return b.clamp_min_(0.0)
 
@@ -120,7 +135,7 @@ def fit_b(
     g_sample: torch.Tensor,
 ) -> torch.Tensor:
     """Alternating fit; returns B [A, K]. `batches` is re-invoked once per epoch."""
-    b = init_b(g_sample, cfg.k, cfg.seed).requires_grad_(True)
+    b = init_b(g_sample, cfg.k, cfg.seed, signed=cfg.signed_b).requires_grad_(True)
     opt = torch.optim.Adam([b], lr=cfg.lr_b)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=max(cfg.epochs, 1), eta_min=cfg.lr_b * 0.05
@@ -129,7 +144,9 @@ def fit_b(
         epoch_loss, n_batches = 0.0, 0
         for g in batches():
             with torch.no_grad():
-                z = solve_codes(g, b.detach(), cfg.z_steps, cfg.w_fn, cfg.lambda_z)
+                z = solve_codes(
+                    g, b.detach(), cfg.z_steps, cfg.w_fn, cfg.lambda_z, cfg.signed_z
+                )
             for _ in range(cfg.b_steps_per_batch):
                 bz = z @ b.T
                 ghat = bz if cfg.no_clip else clip_st(bz)
@@ -138,8 +155,9 @@ def fit_b(
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 opt.step()
-                with torch.no_grad():
-                    b.clamp_min_(0.0)
+                if not cfg.signed_b:
+                    with torch.no_grad():
+                        b.clamp_min_(0.0)
             epoch_loss += loss.item()
             n_batches += 1
         sched.step()
@@ -157,6 +175,8 @@ class HeldOutMetrics:
     clip_rate: float
     mean_l0_g: float
     mean_l0_ghat: float
+    cancellation_index: float = 0.0  # sum(neg contributions)/sum(pos), entries with ĝ>τ_store
+    subzero_rate: float = 0.0  # fraction of entries with Bz < 0 (clipped up to 0)
 
 
 def evaluate_b(
@@ -168,8 +188,14 @@ def evaluate_b(
     code_eps: tuple[float, ...],
     z_steps: int,
     w_fn: float = 1.0,
+    signed_z: bool = False,
 ) -> HeldOutMetrics:
-    """The four-metric suite, accumulated over held-out batches (codes re-solved)."""
+    """The four-metric suite, accumulated over held-out batches (codes re-solved).
+
+    Also accumulates the cancellation diagnostics (identically 0 for nonneg B and z —
+    a free regression check): per entry, pos = Σ_k max(B_ck z_k, 0) and
+    neg = Σ_k max(−B_ck z_k, 0); the index is Σneg/Σpos over entries with ĝ > τ_store.
+    """
     dev = b.device
     resid = torch.zeros((), dtype=torch.float64, device=dev)
     base = torch.zeros((), dtype=torch.float64, device=dev)
@@ -181,12 +207,25 @@ def evaluate_b(
     l0_gh = torch.zeros((), dtype=torch.float64, device=dev)
     code_l0 = {str(e): torch.zeros((), dtype=torch.float64, device=dev) for e in code_eps}
     clipped = torch.zeros((), dtype=torch.float64, device=dev)
+    pos_mass = torch.zeros((), dtype=torch.float64, device=dev)
+    neg_mass = torch.zeros((), dtype=torch.float64, device=dev)
+    subzero = torch.zeros((), dtype=torch.float64, device=dev)
     n_rows = 0
+    has_neg = bool((b < 0).any()) or signed_z
+    b_pos, b_negm = (b.clamp_min(0.0), (-b).clamp_min(0.0)) if has_neg else (None, None)
 
     for g in batches:
-        z = solve_codes(g, b, z_steps, w_fn)
+        z = solve_codes(g, b, z_steps, w_fn, signed_z=signed_z)
         bz = z @ b.T
         ghat = bz.clamp(0.0, 1.0)
+        if has_neg:
+            z_pos, z_negm = z.clamp_min(0.0), (-z).clamp_min(0.0)
+            pos = z_pos @ b_pos.T + z_negm @ b_negm.T
+            neg = z_pos @ b_negm.T + z_negm @ b_pos.T
+            live = ghat > tau_store
+            pos_mass += pos[live].sum(dtype=torch.float64)
+            neg_mass += neg[live].sum(dtype=torch.float64)
+            subzero += (bz < 0).sum(dtype=torch.float64)
         resid += ((g - ghat) ** 2).sum(dtype=torch.float64)
         base += ((g - per_atom_mean) ** 2).sum(dtype=torch.float64)
         imp = g > tau_eval
@@ -197,7 +236,7 @@ def evaluate_b(
         l0_g += (g > tau_store).sum(dtype=torch.float64)
         l0_gh += (ghat > tau_store).sum(dtype=torch.float64)
         for e in code_eps:
-            code_l0[str(e)] += (z > e).sum(dtype=torch.float64)
+            code_l0[str(e)] += (z.abs() > e).sum(dtype=torch.float64)  # |z|: signed-safe
         clipped += (bz > 1.0).sum(dtype=torch.float64)
         n_rows += g.shape[0]
 
@@ -211,4 +250,6 @@ def evaluate_b(
         clip_rate=float((clipped / n_cells).item()),
         mean_l0_g=float(l0_g.item() / n_rows),
         mean_l0_ghat=float(l0_gh.item() / n_rows),
+        cancellation_index=float((neg_mass / pos_mass.clamp_min(1e-9)).item()),
+        subzero_rate=float((subzero / n_cells).item()),
     )

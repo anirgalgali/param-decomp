@@ -34,7 +34,7 @@ def main() -> None:
     import matplotlib.pyplot as plt
 
     run = swap_lib.load_eval_run(args.run_dir)
-    w_fn = 1.0 if args.arm == "sym" else float(args.arm.removeprefix("asym"))
+    solver_params = swap_lib.arm_solver_params(args.arm)
     b = torch.from_numpy(
         np.load(paths.fit_dir(args.k, args.seed, args.arm) / "final.npz")["B"]
     ).to(run.device)
@@ -47,11 +47,16 @@ def main() -> None:
     ghat_store: list[torch.Tensor] = []
     g_store: list[torch.Tensor] = []
 
+    klu_sum, klu_n = 0.0, 0
     for i, mb in enumerate(swap_lib.micro_slices()):
         tokens_mb = run.tokens[mb]
         ci_true = swap_lib.true_ci(run, tokens_mb)
-        gh, _ = swap_lib.ghat_dict(run, ci_true, b, w_fn=w_fn)
+        gh, _ = swap_lib.ghat_dict(run, ci_true, b, **solver_params)
         tgt = swap_lib.target_logits(run, tokens_mb)
+        lu = swap_lib.masked_forward(run, tokens_mb, ci_true, "unmasked")
+        klu = swap_lib.per_position_kl(lu, tgt)
+        klu_sum += float(klu.sum().item())
+        klu_n += klu.numel()
 
         g_flat = swap_lib.ci_dict_to_flat(run, ci_true)
         h_flat = swap_lib.ci_dict_to_flat(run, gh)
@@ -131,6 +136,9 @@ def main() -> None:
         "ghat_mean_kl_ci95": [float(np.quantile(boots, 0.025)), float(np.quantile(boots, 0.975))],
         "ratio_mean": float(per_tok_h.mean() / per_tok_g.mean()),
         "ratio_p99": float(np.quantile(per_tok_h, 0.99) / np.quantile(per_tok_g, 0.99)),
+        "harry_excess_ratio_stoch": float(
+            (per_tok_h.mean() - klu_sum / klu_n) / max(per_tok_g.mean() - klu_sum / klu_n, 1e-9)
+        ),
         "mean_dropped_atoms_per_token": float(dropped_count.mean()),
         "worst_tokens": worst_rows[:20],
         "dropped_atom_table": dropped_table,

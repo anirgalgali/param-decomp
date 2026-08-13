@@ -44,20 +44,32 @@ def _row_forward(run, tokens_mb, ci, row):
     raise ValueError(row)
 
 
+def cond_arm(cond: str) -> str | None:
+    """The fit arm a condition's B comes from; None for the true-g reference.
+
+    `shuffled` / `shuffled-<arm>` shuffles that arm's B (bare form = sym, the Rung-2
+    convention); `binarized` / `covering` are sym-based variants.
+    """
+    if cond == "g":
+        return None
+    if cond.startswith("shuffled"):
+        rest = cond.removeprefix("shuffled").removeprefix("-")
+        return rest or "sym"
+    if cond in ("binarized", "covering"):
+        return "sym"
+    return cond
+
+
 def _condition_ci(run, ci_true, b, cond):
     if cond == "g":
         return swap_lib.ghat_dict(run, ci_true, b, identity=True)[0]
-    if cond.startswith("asym"):
-        return swap_lib.ghat_dict(run, ci_true, b, w_fn=float(cond.removeprefix("asym")))[0]
-    if cond == "sym":
-        return swap_lib.ghat_dict(run, ci_true, b)[0]
-    if cond == "shuffled":
-        return swap_lib.ghat_dict(run, ci_true, b)[0]  # b already shuffled by caller
     if cond == "binarized":
         return swap_lib.ghat_dict(run, ci_true, b, binarize_at=constants.TAU_EVAL)[0]
     if cond == "covering":
         return swap_lib.ghat_dict(run, ci_true, b, covering=True)[0]
-    raise ValueError(cond)
+    arm = cond_arm(cond)
+    assert arm is not None
+    return swap_lib.ghat_dict(run, ci_true, b, **swap_lib.arm_solver_params(arm))[0]
 
 
 def _bootstrap_ci(per_seq: np.ndarray, seed: int = 0) -> tuple[float, float]:
@@ -80,13 +92,15 @@ def main() -> None:
     conditions = args.conditions.split(",")
 
     def load_b(cond):
-        if cond == "g":
+        arm = cond_arm(cond)
+        if arm is None:
             return None
-        arm = "sym" if cond in ("sym", "shuffled", "binarized", "covering") else cond
         b = torch.from_numpy(
             np.load(paths.fit_dir(args.k, args.seed, arm) / "final.npz")["B"]
         ).to(run.device)
-        return shuffled_b(b.cpu(), args.seed).to(run.device) if cond == "shuffled" else b
+        if cond.startswith("shuffled"):
+            b = shuffled_b(b.cpu(), args.seed).to(run.device)
+        return b
 
     b_by_cond = {c: load_b(c) for c in conditions}
     n_seqs = run.tokens.shape[0]
@@ -138,6 +152,16 @@ def main() -> None:
                 "ce_difference": r["ce_sum"] / r["ce_n"] - target_ce,
                 "mask_l0": (r["mask_l0"] / n_pos_total) if r["mask_l0"] else None,
             }
+
+    # Dual-band reporting (Rung 1S): appendix-B convention — ratio of excess KL over the
+    # unmasked(ones) baseline, decoded vs real floors, deterministic (CI-as-masks) family.
+    if "g" in table:
+        g_excess = table["g"]["ci"]["kl"] - table["g"]["unmasked"]["kl"]
+        for cond in conditions:
+            if cond == "g":
+                continue
+            excess = table[cond]["ci"]["kl"] - table[cond]["unmasked"]["kl"]
+            table[cond]["harry_excess_ratio_det"] = excess / max(g_excess, 1e-9)
 
     report = {
         "k": args.k, "seed": args.seed, "conditions": conditions,

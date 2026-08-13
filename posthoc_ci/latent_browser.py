@@ -70,17 +70,23 @@ def main() -> None:
     )
     for rec in report["latents"]:
         xm = ", ".join(f"{m} {v:.0%}" for m, v in rec["cross_matrix"]["top_matrices"])
+        neg = rec.get("neg_mass_frac", 0.0)
+        neg_txt = f" · inhibitory mass {neg:.0%}" if neg else ""
         parts.append(
             f"<div class='latent' id='L{rec['latent']}'><h2>latent #{rec['latent']}</h2>"
             f"<div class='meta'>mean top-z {rec['mean_top_z']} · density {rec['density']} · "
-            f"mass: {xm}</div>"
+            f"mass: {xm}{neg_txt}</div>"
         )
         parts.extend(_ctx_html(c, "z") for c in rec["contexts"][:20])
         parts.append("<details><summary>member atoms</summary><div class='members'>")
         for m in rec["members"]:
             flags = "".join(
                 f"<span class='flag'>{f}</span>"
-                for f, on in (("HUB", m["is_hub"]), ("POSITIONAL", m["is_positional"]))
+                for f, on in (
+                    ("HUB", m["is_hub"]),
+                    ("POSITIONAL", m["is_positional"]),
+                    ("INHIBITORY", m["b_weight"] < 0),
+                )
                 if on
             )
             share = m.get("row_share")

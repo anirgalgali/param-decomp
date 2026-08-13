@@ -46,14 +46,14 @@ def member_pairs(b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
     k = b.shape[1]
     n_members = min(N_MEMBERS, b.shape[0])
-    member_idx = torch.topk(b, n_members, dim=0).indices  # [n_members, K]
+    member_idx = torch.topk(b.abs(), n_members, dim=0).indices  # |B|: signed-safe
     pair_latent = torch.arange(k, device=b.device).repeat_interleave(n_members)
     pair_atom = member_idx.T.reshape(-1)
     return pair_latent, pair_atom
 
 
 def _codes_topk(
-    b: torch.Tensor, device: str
+    b: torch.Tensor, device: str, signed_z: bool = False, code_sign: int = 1
 ) -> tuple[torch.Tensor, torch.Tensor, np.ndarray, torch.Tensor, torch.Tensor]:
     """One streaming pass: per-latent top-30 by z, firing density, and per-(latent,
     member) conditioned top-8 — positions maximizing z_k among those where the member
@@ -72,12 +72,12 @@ def _codes_topk(
     rows_per_shard = constants.HARVEST_SHARD_POSITIONS
     for shard_idx, csr in glib.iter_shards("all"):
         g = torch.from_numpy(csr.toarray()).to(device)
-        z = solve_codes(g, b, constants.Z_SOLVER_N_STEPS)
+        z = solve_codes(g, b, constants.Z_SOLVER_N_STEPS, signed_z=signed_z)
         pos0 = shard_idx * rows_per_shard
-        top_vals, top_pos = _merge_topk(top_vals, top_pos, z, pos0)
-        scores = z[:, pair_latent] * (g[:, pair_atom] > constants.TAU_EVAL)
+        top_vals, top_pos = _merge_topk(top_vals, top_pos, code_sign * z, pos0)
+        scores = z[:, pair_latent].abs() * (g[:, pair_atom] > constants.TAU_EVAL)
         cond_vals, cond_pos = _merge_topk(cond_vals, cond_pos, scores, pos0)
-        fire_count += (z > 0.01).sum(dim=0, dtype=torch.float64)
+        fire_count += (z.abs() > 0.01).sum(dim=0, dtype=torch.float64)
         n_rows += z.shape[0]
     density = (fire_count / n_rows).cpu().numpy()
     return top_vals, top_pos, density, cond_vals, cond_pos
@@ -102,7 +102,7 @@ def _stability(k: int, arm: str) -> np.ndarray:
         mats.append(b / (np.linalg.norm(b, axis=0, keepdims=True) + 1e-9))
     sims = []
     for other in (1, 2):
-        cos = mats[0].T @ mats[other]
+        cos = np.abs(mats[0].T @ mats[other])  # |cos|: sign flips are gauge
         row, col = linear_sum_assignment(-cos)
         sims.append(cos[row, col])
     return np.concatenate(sims)
@@ -113,6 +113,8 @@ def main() -> None:
     parser.add_argument("--k", type=int, required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--arm", default="sym")
+    parser.add_argument("--code-sign", choices=["pos", "neg"], default="pos",
+                        help="for signed-z arms: browse +z or -z engagements")
     args = parser.parse_args()
     apply_style()
     import matplotlib.pyplot as plt
@@ -133,9 +135,15 @@ def main() -> None:
     positional = _atom_id_set(paths.HARVEST_DIR / "positional_atoms.json")
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
 
-    top_vals, top_pos, density, cond_vals, cond_pos = _codes_topk(b, device)
+    from posthoc_ci.swap_lib import arm_solver_params
+
+    signed_z = arm_solver_params(args.arm)["signed_z"]
+    code_sign = 1 if args.code_sign == "pos" else -1
+    top_vals, top_pos, density, cond_vals, cond_pos = _codes_topk(
+        b, device, signed_z=signed_z, code_sign=code_sign
+    )
     pair_latent, pair_atom = member_pairs(b)
-    b_row_sums = b.sum(dim=1).cpu().numpy()  # atom's total mass across all latents
+    b_row_sums = b.abs().sum(dim=1).cpu().numpy()  # atom's total |mass| across latents
     atom_top = np.load(paths.LATENTS_DIR / "atom_top30.npz")
 
     mean_z_order = np.argsort(-top_vals.mean(dim=0).cpu().numpy())
@@ -144,7 +152,8 @@ def main() -> None:
     latents = []
     for latent in mean_z_order[: N_FEATURED * 2]:
         col = b[:, latent].cpu().numpy()
-        mass = col / (col.sum() + 1e-12)
+        abs_col = np.abs(col)
+        mass = abs_col / (abs_col.sum() + 1e-12)
         pair_rows = np.arange(latent * N_MEMBERS, (latent + 1) * N_MEMBERS)
         member_idx = pair_atom[pair_rows].cpu().numpy()  # same members, topk order
         member_atom_ids = alive.atom_id.to_numpy()[member_idx]
@@ -180,7 +189,7 @@ def main() -> None:
                     "module": alive.module.iloc[mi],
                     "c": int(alive.c.iloc[mi]),
                     "b_weight": round(float(col[mi]), 4),
-                    "row_share": round(float(col[mi] / max(b_row_sums[mi], 1e-12)), 3),
+                    "row_share": round(float(abs(col[mi]) / max(b_row_sums[mi], 1e-12)), 3),
                     "is_hub": bool(aid in hubs),
                     "is_positional": bool(aid in positional),
                     "contexts": m_ctx,
@@ -193,6 +202,7 @@ def main() -> None:
                 "mean_top_z": round(float(top_vals[:, latent].mean()), 3),
                 "density": round(float(density[latent]), 4),
                 "is_hub_latent": is_hub_latent,
+                "neg_mass_frac": round(float(np.abs(col[col < 0]).sum() / (abs_col.sum() + 1e-12)), 3),
                 "cross_matrix": {
                     "n_matrices_ge_20pct": int(n_big),
                     "spans_attn_and_mlp": bool(

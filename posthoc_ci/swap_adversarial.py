@@ -33,14 +33,18 @@ def main() -> None:
     conditions = args.conditions.split(",")
     step_counts = [int(s) for s in args.steps.split(",")]
 
+    from posthoc_ci.swap_deterministic import cond_arm
+
     def load_b(cond):
-        if cond == "g":
+        arm = cond_arm(cond)
+        if arm is None:
             return None
-        arm = "sym" if cond in ("sym", "shuffled", "binarized", "covering") else cond
         b = torch.from_numpy(
             np.load(paths.fit_dir(args.k, args.seed, arm) / "final.npz")["B"]
         ).to(run.device)
-        return shuffled_b(b.cpu(), args.seed).to(run.device) if cond == "shuffled" else b
+        if cond.startswith("shuffled"):
+            b = shuffled_b(b.cpu(), args.seed).to(run.device)
+        return b
 
     # precompute per-micro-batch floors (CPU fp16) and target logits (kept on GPU: small)
     print("precomputing floors per condition...")
@@ -60,15 +64,14 @@ def main() -> None:
                 ci = ci_true
             elif cond == "binarized":
                 ci = swap_lib.ghat_dict(run, ci_true, load_b(cond), binarize_at=constants.TAU_EVAL)[0]
-            elif cond.startswith("asym"):
-                ci = swap_lib.ghat_dict(run, ci_true, load_b(cond),
-                                        w_fn=float(cond.removeprefix("asym")))[0]
             elif cond == "covering":
                 ci = swap_lib.ghat_dict(run, ci_true, load_b(cond), covering=True)[0]
-            elif cond in ("sym", "shuffled"):
-                ci = swap_lib.ghat_dict(run, ci_true, load_b(cond))[0]
             else:
-                raise ValueError(cond)
+                arm = cond_arm(cond)
+                assert arm is not None, cond
+                ci = swap_lib.ghat_dict(
+                    run, ci_true, load_b(cond), **swap_lib.arm_solver_params(arm)
+                )[0]
             floors_l0[cond] += swap_lib.induced_l0(run, ci, constants.TAU_STORE) * n_pos
             ci_by_cond[cond].append({k: v.to(torch.float16).cpu() for k, v in ci.items()})
 

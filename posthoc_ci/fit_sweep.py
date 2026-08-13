@@ -23,8 +23,17 @@ from posthoc_ci.figstyle import SERIES, apply_style, save
 from posthoc_ci.nmf import FitConfig, HeldOutMetrics, evaluate_b, fit_b
 
 
-def _arm_name(w_fn: float) -> str:
-    return "sym" if w_fn == 1.0 else f"asym{w_fn:g}"
+def _arm_name(w_fn: float, signed_b: bool = False, signed_z: bool = False) -> str:
+    if signed_z:
+        assert signed_b, "signed z without signed B is not a studied arm"
+        base = "sgnBZ"
+    elif signed_b:
+        base = "sgnB"
+    else:
+        base = "sym" if w_fn == 1.0 else f"asym{w_fn:g}"
+    if signed_b and w_fn != 1.0:
+        base += f"-asym{w_fn:g}"
+    return base
 
 
 def _batches(split: str, device: str, seed: int | None = None):
@@ -34,11 +43,23 @@ def _batches(split: str, device: str, seed: int | None = None):
     return gen
 
 
-def fit_one(k: int, seed: int, w_fn: float, no_clip: bool, epochs: int) -> None:
+def fit_one(
+    k: int,
+    seed: int,
+    w_fn: float,
+    no_clip: bool,
+    epochs: int,
+    signed_b: bool = False,
+    signed_z: bool = False,
+) -> None:
     device = "cuda"
     torch.manual_seed(seed)
-    cfg = FitConfig(k=k, seed=seed, w_fn=w_fn, epochs=epochs, no_clip=no_clip)
-    out_dir = paths.fit_dir(k, seed, _arm_name(w_fn))
+    arm = _arm_name(w_fn, signed_b, signed_z)
+    cfg = FitConfig(
+        k=k, seed=seed, w_fn=w_fn, epochs=epochs, no_clip=no_clip,
+        signed_b=signed_b, signed_z=signed_z,
+    )
+    out_dir = paths.fit_dir(k, seed, arm)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     g_sample = next(_batches("train", device, seed=seed)())
@@ -54,9 +75,13 @@ def fit_one(k: int, seed: int, w_fn: float, no_clip: bool, epochs: int) -> None:
         constants.CODE_L0_EPSILONS,
         constants.Z_SOLVER_N_STEPS,
         w_fn=w_fn,
+        signed_z=signed_z,
     )
     np.savez_compressed(out_dir / "final.npz", B=b.cpu().numpy().astype(np.float32))
-    record = {"k": k, "seed": seed, "arm": _arm_name(w_fn), "no_clip": no_clip, **vars(metrics)}
+    record = {
+        "k": k, "seed": seed, "arm": arm, "no_clip": no_clip,
+        "signed_b": signed_b, "signed_z": signed_z, **vars(metrics),
+    }
     (out_dir / "metrics.json").write_text(json.dumps(record, indent=2))
     print(json.dumps(record, indent=2))
 
@@ -173,6 +198,8 @@ def main() -> None:
     parser.add_argument("--w-fn", type=float, default=1.0)
     parser.add_argument("--no-clip", action="store_true")
     parser.add_argument("--epochs", type=int, default=4)
+    parser.add_argument("--signed-b", action="store_true")
+    parser.add_argument("--signed-z", action="store_true")
     parser.add_argument("--aggregate", action="store_true")
     args = parser.parse_args()
 
@@ -180,7 +207,8 @@ def main() -> None:
         aggregate()
     else:
         assert args.k is not None, "--k required unless --aggregate"
-        fit_one(args.k, args.seed, args.w_fn, args.no_clip, args.epochs)
+        fit_one(args.k, args.seed, args.w_fn, args.no_clip, args.epochs,
+                args.signed_b, args.signed_z)
 
 
 if __name__ == "__main__":

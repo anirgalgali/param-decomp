@@ -32,6 +32,19 @@ from posthoc_ci.nmf import solve_codes
 MICRO_SEQS = 16
 
 
+def arm_solver_params(arm: str) -> dict:
+    """Solver settings implied by an arm name (sym, asym<w>, sgnB, sgnBZ, sgnB-asym<w>).
+
+    The B matrix's sign structure lives in the fit itself; only the code-solve settings
+    (w_fn, signed_z) need re-deriving at substitution time.
+    """
+    signed_z = arm.startswith("sgnBZ")
+    w_fn = 1.0
+    if "asym" in arm:
+        w_fn = float(arm.rsplit("asym", 1)[1])
+    return {"w_fn": w_fn, "signed_z": signed_z}
+
+
 @dataclass
 class EvalRun:
     model: object  # ComponentModel
@@ -100,11 +113,13 @@ def ghat_dict(
     binarize_at: float | None = None,
     identity: bool = False,
     covering: bool = False,
+    signed_z: bool = False,
 ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
     """Reconstructed floors for one micro-batch, plus encode stats.
 
     identity=True bypasses the code entirely (ĝ := g) — the harness self-test.
     covering=True solves coverage-constrained codes (Bz >= g - eps; amendment 4).
+    signed_z=True solves an unconstrained code (Rung 1S, in-loop family).
     """
     from posthoc_ci.nmf import solve_covering
 
@@ -116,7 +131,7 @@ def ghat_dict(
     if covering:
         z, violation = solve_covering(g_alive, b)
     else:
-        z = solve_codes(g_alive, b, constants.Z_SOLVER_N_STEPS, w_fn)
+        z = solve_codes(g_alive, b, constants.Z_SOLVER_N_STEPS, w_fn, signed_z=signed_z)
         violation = float("nan")
     bz = z @ b.T
     ghat_alive = bz.clamp(0.0, 1.0)
@@ -126,7 +141,7 @@ def ghat_dict(
     out[..., run.alive_cols] = ghat_alive.reshape(*lead, -1)
     stats = {
         "clip_rate": float((bz > 1.0).float().mean().item()),
-        "code_l0_0.01": float((z > 0.01).float().sum(-1).mean().item()),
+        "code_l0_0.01": float((z.abs() > 0.01).float().sum(-1).mean().item()),
         "covering_violation": violation,
     }
     return flat_to_ci_dict(run, out), stats
