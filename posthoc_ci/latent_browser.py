@@ -35,6 +35,7 @@ h2 { margin: 0 0 2px; } .meta { color: #52514e; font-size: 12px; margin-bottom: 
 .member h4 { margin: 0 0 4px; font-size: 13px; }
 .flag { color: #eb6834; font-size: 11px; font-weight: 600; margin-left: 6px; }
 .xmat { font-size: 12px; color: #52514e; }
+.ctxlabel { font-size: 11px; color: #52514e; margin: 6px 0 2px; font-style: italic; }
 details > summary { cursor: pointer; color: #2a78d6; font-size: 13px; margin: 6px 0; }
 """
 
@@ -82,11 +83,22 @@ def main() -> None:
                 for f, on in (("HUB", m["is_hub"]), ("POSITIONAL", m["is_positional"]))
                 if on
             )
+            share = m.get("row_share")
+            share_txt = f" · {share:.0%} of atom's mass in this latent" if share is not None else ""
             parts.append(
                 f"<div class='member'><h4>{m['module']}:{m['c']} "
-                f"<span class='xmat'>B={m['b_weight']}</span>{flags}</h4>"
+                f"<span class='xmat'>B={m['b_weight']}{share_txt}</span>{flags}</h4>"
             )
-            parts.extend(_ctx_html(c, "g") for c in m["contexts"][:6])
+            cond = m.get("conditioned_contexts", [])
+            parts.append("<div class='ctxlabel'>while this latent is engaged (by z):</div>")
+            if cond:
+                parts.extend(_ctx_html(c, "z") for c in cond[:6])
+            else:
+                parts.append(
+                    "<div class='ctxlabel'>— never fires above 0.1 while latent engaged</div>"
+                )
+            parts.append("<div class='ctxlabel'>global top firings (by g, all uses mixed):</div>")
+            parts.extend(_ctx_html(c, "g") for c in m["contexts"][:4])
             parts.append("</div>")
         parts.append("</div></details></div>")
     parts.append("</main></div>")

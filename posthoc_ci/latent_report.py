@@ -34,25 +34,53 @@ N_MEMBERS = 8
 WINDOW = 16
 
 
-def _codes_topk(b: torch.Tensor, device: str) -> tuple[torch.Tensor, torch.Tensor, np.ndarray]:
-    """Top-30 harvest positions per latent by z, plus per-latent firing density."""
+N_COND = 8
+
+
+def member_pairs(b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """(pair_latent, pair_atom) index vectors for every latent's top-N_MEMBERS atoms.
+
+    Members are a function of B alone, so the (latent, member-atom) pairs are known
+    before any pass over the data — length K * N_MEMBERS each, pair i belonging to
+    latent pair_latent[i] and alive-atom column pair_atom[i].
+    """
     k = b.shape[1]
+    n_members = min(N_MEMBERS, b.shape[0])
+    member_idx = torch.topk(b, n_members, dim=0).indices  # [n_members, K]
+    pair_latent = torch.arange(k, device=b.device).repeat_interleave(n_members)
+    pair_atom = member_idx.T.reshape(-1)
+    return pair_latent, pair_atom
+
+
+def _codes_topk(
+    b: torch.Tensor, device: str
+) -> tuple[torch.Tensor, torch.Tensor, np.ndarray, torch.Tensor, torch.Tensor]:
+    """One streaming pass: per-latent top-30 by z, firing density, and per-(latent,
+    member) conditioned top-8 — positions maximizing z_k among those where the member
+    atom itself fires (g > TAU_EVAL). The conditioning is what makes the member panel
+    mixture-aware: ĝ is a sum over latents, so an atom's *global* firings mix all its
+    uses; these are its firings while THIS latent is engaged.
+    """
+    k = b.shape[1]
+    pair_latent, pair_atom = member_pairs(b)
     top_vals = torch.zeros(TOPK, k, device=device)
     top_pos = torch.zeros(TOPK, k, dtype=torch.int64, device=device)
+    cond_vals = torch.zeros(N_COND, len(pair_latent), device=device)
+    cond_pos = torch.zeros(N_COND, len(pair_latent), dtype=torch.int64, device=device)
     fire_count = torch.zeros(k, dtype=torch.float64, device=device)
     n_rows = 0
-    token_meta = glib.load_token_meta()
     rows_per_shard = constants.HARVEST_SHARD_POSITIONS
     for shard_idx, csr in glib.iter_shards("all"):
         g = torch.from_numpy(csr.toarray()).to(device)
         z = solve_codes(g, b, constants.Z_SOLVER_N_STEPS)
         pos0 = shard_idx * rows_per_shard
         top_vals, top_pos = _merge_topk(top_vals, top_pos, z, pos0)
+        scores = z[:, pair_latent] * (g[:, pair_atom] > constants.TAU_EVAL)
+        cond_vals, cond_pos = _merge_topk(cond_vals, cond_pos, scores, pos0)
         fire_count += (z > 0.01).sum(dim=0, dtype=torch.float64)
         n_rows += z.shape[0]
-    del token_meta
     density = (fire_count / n_rows).cpu().numpy()
-    return top_vals, top_pos, density
+    return top_vals, top_pos, density, cond_vals, cond_pos
 
 
 def _window(tokens: np.ndarray, tokenizer, pos: int, seq_len: int) -> dict:
@@ -105,7 +133,9 @@ def main() -> None:
     positional = _atom_id_set(paths.HARVEST_DIR / "positional_atoms.json")
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
 
-    top_vals, top_pos, density = _codes_topk(b, device)
+    top_vals, top_pos, density, cond_vals, cond_pos = _codes_topk(b, device)
+    pair_latent, pair_atom = member_pairs(b)
+    b_row_sums = b.sum(dim=1).cpu().numpy()  # atom's total mass across all latents
     atom_top = np.load(paths.LATENTS_DIR / "atom_top30.npz")
 
     mean_z_order = np.argsort(-top_vals.mean(dim=0).cpu().numpy())
@@ -115,7 +145,8 @@ def main() -> None:
     for latent in mean_z_order[: N_FEATURED * 2]:
         col = b[:, latent].cpu().numpy()
         mass = col / (col.sum() + 1e-12)
-        member_idx = np.argsort(-col)[:N_MEMBERS]
+        pair_rows = np.arange(latent * N_MEMBERS, (latent + 1) * N_MEMBERS)
+        member_idx = pair_atom[pair_rows].cpu().numpy()  # same members, topk order
         member_atom_ids = alive.atom_id.to_numpy()[member_idx]
         is_hub_latent = bool(density[latent] > 0.5 or member_atom_ids[0] in hubs)
 
@@ -131,10 +162,16 @@ def main() -> None:
             if v > 0
         ]
         members = []
-        for mi, aid in zip(member_idx, member_atom_ids, strict=True):
+        for rank, (mi, aid) in enumerate(zip(member_idx, member_atom_ids, strict=True)):
             m_ctx = [
                 {"g": round(float(v), 3), **_window(tokens, tokenizer, int(p), seq_len)}
                 for v, p in zip(atom_top["values"][:8, aid], atom_top["positions"][:8, aid], strict=True)
+                if v > 0
+            ]
+            pr = int(pair_rows[rank])
+            c_ctx = [
+                {"z": round(float(v), 3), **_window(tokens, tokenizer, int(p), seq_len)}
+                for v, p in zip(cond_vals[:, pr].cpu(), cond_pos[:, pr].cpu(), strict=True)
                 if v > 0
             ]
             members.append(
@@ -143,9 +180,11 @@ def main() -> None:
                     "module": alive.module.iloc[mi],
                     "c": int(alive.c.iloc[mi]),
                     "b_weight": round(float(col[mi]), 4),
+                    "row_share": round(float(col[mi] / max(b_row_sums[mi], 1e-12)), 3),
                     "is_hub": bool(aid in hubs),
                     "is_positional": bool(aid in positional),
                     "contexts": m_ctx,
+                    "conditioned_contexts": c_ctx,
                 }
             )
         latents.append(
