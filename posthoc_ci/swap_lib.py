@@ -45,6 +45,18 @@ def arm_solver_params(arm: str) -> dict:
     return {"w_fn": w_fn, "signed_z": signed_z}
 
 
+def arm_is_rectified(arm: str) -> bool:
+    return arm.startswith("rect")
+
+
+def load_fit(fit_dir, device) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """(B, bias-or-None) from a fit's final.npz — bias present only for rect arms."""
+    data = np.load(fit_dir / "final.npz")
+    b = torch.from_numpy(data["B"]).to(device)
+    bias = torch.from_numpy(data["b"]).to(device) if "b" in data.files else None
+    return b, bias
+
+
 @dataclass
 class EvalRun:
     model: object  # ComponentModel
@@ -114,12 +126,14 @@ def ghat_dict(
     identity: bool = False,
     covering: bool = False,
     signed_z: bool = False,
+    bias: torch.Tensor | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
     """Reconstructed floors for one micro-batch, plus encode stats.
 
     identity=True bypasses the code entirely (ĝ := g) — the harness self-test.
     covering=True solves coverage-constrained codes (Bz >= g - eps; amendment 4).
     signed_z=True solves an unconstrained code (Rung 1S, in-loop family).
+    bias (Rung 1R): the per-atom hurdle; ĝ = clip(Bz - bias, 0, 1).
     """
     from posthoc_ci.nmf import solve_covering
 
@@ -129,11 +143,16 @@ def ghat_dict(
     lead = flat.shape[:-1]
     g_alive = flat[..., run.alive_cols].reshape(-1, len(run.alive_cols))
     if covering:
+        assert bias is None, "covering condition is defined on the plain nonneg family"
         z, violation = solve_covering(g_alive, b)
     else:
-        z = solve_codes(g_alive, b, constants.Z_SOLVER_N_STEPS, w_fn, signed_z=signed_z)
+        z = solve_codes(
+            g_alive, b, constants.Z_SOLVER_N_STEPS, w_fn, signed_z=signed_z, bias=bias
+        )
         violation = float("nan")
     bz = z @ b.T
+    if bias is not None:
+        bz = bz - bias
     ghat_alive = bz.clamp(0.0, 1.0)
     if binarize_at is not None:
         ghat_alive = (ghat_alive > binarize_at).float()
@@ -209,6 +228,89 @@ def masked_forward(
 
 def mb_seed(draw: int, mb_index: int) -> int:
     return constants.RNG_BASE_KEY + 7919 * draw + mb_index
+
+
+def pgd_hardened_kl(
+    run: EvalRun,
+    ci_per_mb: list[dict[str, torch.Tensor]],
+    target_per_mb: list[torch.Tensor],
+    n_steps: int,
+    step_size: float,
+    seed: int,
+    n_restarts: int = 3,
+    scope: str = "shared",
+) -> dict:
+    """Hardened E2.3R cell: multiple independent restarts (report the max — the
+    adversary keeps its best attack) under either source scope.
+
+    scope='shared': the paper protocol (one source vector broadcast batch-wide).
+    scope='per_token': every position gets its own sources — a strictly stronger
+    attacker searching a ~40k-dim box per position instead of one shared point.
+    Per-token needs no cross-micro-batch coupling, so each micro-batch runs its own
+    independent ascent.
+    """
+    kls = []
+    for r in range(n_restarts):
+        if scope == "shared":
+            kl = pgd_shared_kl(run, ci_per_mb, target_per_mb, n_steps, step_size,
+                               seed + 7919 * r)
+        else:
+            kl = _pgd_per_token_kl(run, ci_per_mb, target_per_mb, n_steps, step_size,
+                                   seed + 7919 * r)
+        kls.append(kl)
+    return {"max": max(kls), "restarts": kls, "scope": scope}
+
+
+def _pgd_per_token_kl(
+    run: EvalRun,
+    ci_per_mb: list[dict[str, torch.Tensor]],
+    target_per_mb: list[torch.Tensor],
+    n_steps: int,
+    step_size: float,
+    seed: int,
+) -> float:
+    device = run.device
+    slices_ = micro_slices()
+    n_total = sum(t.shape[0] * t.shape[1] for t in target_per_mb)
+    total = 0.0
+    for i, mb in enumerate(slices_):
+        torch.manual_seed(seed + i)
+        tokens_mb = run.tokens[mb]
+        lead = tokens_mb.shape
+        ci_mb = {k: v.to(device, torch.float32) for k, v in ci_per_mb[i].items()}
+        target_mb = target_per_mb[i].to(device, torch.float32)
+        sources = {
+            m: torch.rand(*lead, run.model.module_to_c[m] + 1, device=device
+                          ).requires_grad_(True)
+            for m in run.modules
+        }
+
+        def forward() -> torch.Tensor:
+            comp = {k: v[..., :-1] for k, v in sources.items()}
+            wdm = {k: (run.weight_deltas[k], sources[k][..., -1])
+                   for k in run.weight_deltas}
+            infos = make_mask_infos(
+                component_masks=interpolate_component_mask(ci_mb, comp),
+                weight_deltas_and_masks=wdm,
+            )
+            with torch.autocast("cuda", torch.bfloat16, enabled=run.autocast):
+                logits = run.model(tokens_mb, mask_infos=infos)
+            sum_kl, _ = recon_loss_kl(pred=logits.float(), target=target_mb)
+            return sum_kl
+
+        for _ in range(n_steps):
+            with torch.enable_grad():
+                sum_kl = forward()
+            grads = torch.autograd.grad(sum_kl, list(sources.values()))
+            with torch.no_grad():
+                for k, gk in zip(sources, grads, strict=True):
+                    sources[k].add_(step_size * gk.sign())
+                    sources[k].clamp_(0.0, 1.0)
+        with torch.no_grad():
+            total += float(forward().item())
+        del sources, ci_mb, target_mb
+        torch.cuda.empty_cache()
+    return total / n_total
 
 
 def pgd_shared_kl(

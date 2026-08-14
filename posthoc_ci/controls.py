@@ -26,6 +26,16 @@ def shuffled_b(b: torch.Tensor, seed: int) -> torch.Tensor:
     return b[perm]
 
 
+def shuffled_fit(
+    b: torch.Tensor, bias: torch.Tensor | None, seed: int
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Atom-identity shuffle: permute B rows AND the per-atom hurdle with the SAME
+    permutation (Rung 1R control — hurdles travel with their atoms)."""
+    gen = torch.Generator().manual_seed(seed + 1000)
+    perm = torch.randperm(b.shape[0], generator=gen)
+    return b[perm], (bias[perm] if bias is not None else None)
+
+
 def random_b(b: torch.Tensor, seed: int) -> torch.Tensor:
     """Random nonneg B with each column's sparsity and value distribution matched."""
     gen = torch.Generator().manual_seed(seed + 2000)

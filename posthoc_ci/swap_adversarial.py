@@ -16,7 +16,7 @@ import numpy as np
 import torch
 
 from posthoc_ci import constants, paths, swap_lib
-from posthoc_ci.controls import shuffled_b
+from posthoc_ci.controls import shuffled_fit
 
 
 def main() -> None:
@@ -27,6 +27,8 @@ def main() -> None:
     parser.add_argument("--conditions", default="g,sym")
     parser.add_argument("--steps", default="20")
     parser.add_argument("--tag", default="")
+    parser.add_argument("--hardened", action="store_true",
+                        help="E2.3R hardened cell: 3 restarts x {shared, per_token}")
     args = parser.parse_args()
 
     run = swap_lib.load_eval_run(args.run_dir)
@@ -38,13 +40,14 @@ def main() -> None:
     def load_b(cond):
         arm = cond_arm(cond)
         if arm is None:
-            return None
-        b = torch.from_numpy(
-            np.load(paths.fit_dir(args.k, args.seed, arm) / "final.npz")["B"]
-        ).to(run.device)
+            return None, None
+        b, bias = swap_lib.load_fit(paths.fit_dir(args.k, args.seed, arm), run.device)
         if cond.startswith("shuffled"):
-            b = shuffled_b(b.cpu(), args.seed).to(run.device)
-        return b
+            b, bias = shuffled_fit(b.cpu(), bias.cpu() if bias is not None else None,
+                                   args.seed)
+            b = b.to(run.device)
+            bias = bias.to(run.device) if bias is not None else None
+        return b, bias
 
     # precompute per-micro-batch floors (CPU fp16) and target logits (kept on GPU: small)
     print("precomputing floors per condition...")
@@ -63,14 +66,16 @@ def main() -> None:
             if cond == "g":
                 ci = ci_true
             elif cond == "binarized":
-                ci = swap_lib.ghat_dict(run, ci_true, load_b(cond), binarize_at=constants.TAU_EVAL)[0]
+                ci = swap_lib.ghat_dict(run, ci_true, load_b(cond)[0],
+                                        binarize_at=constants.TAU_EVAL)[0]
             elif cond == "covering":
-                ci = swap_lib.ghat_dict(run, ci_true, load_b(cond), covering=True)[0]
+                ci = swap_lib.ghat_dict(run, ci_true, load_b(cond)[0], covering=True)[0]
             else:
                 arm = cond_arm(cond)
                 assert arm is not None, cond
+                b_c, bias_c = load_b(cond)
                 ci = swap_lib.ghat_dict(
-                    run, ci_true, load_b(cond), **swap_lib.arm_solver_params(arm)
+                    run, ci_true, b_c, bias=bias_c, **swap_lib.arm_solver_params(arm)
                 )[0]
             floors_l0[cond] += swap_lib.induced_l0(run, ci, constants.TAU_STORE) * n_pos
             ci_by_cond[cond].append({k: v.to(torch.float16).cpu() for k, v in ci.items()})
@@ -88,6 +93,17 @@ def main() -> None:
             results[cond][f"adv_kl_{n_steps}steps"] = kl
             print(f"{cond} @ {n_steps} steps: KL {kl:.4f}")
             torch.cuda.empty_cache()
+        if args.hardened:
+            for scope in ("shared", "per_token"):
+                h = swap_lib.pgd_hardened_kl(
+                    run, ci_by_cond[cond], target_per_mb,
+                    n_steps=20, step_size=constants.PGD_STEP_SIZE,
+                    seed=constants.RNG_BASE_KEY, n_restarts=3, scope=scope,
+                )
+                results[cond][f"adv_kl_hardened_{scope}"] = h
+                print(f"{cond} hardened/{scope}: max KL {h['max']:.4f} "
+                      f"(restarts {[round(x, 3) for x in h['restarts']]})")
+                torch.cuda.empty_cache()
 
     if "g" in results:
         ref20 = results["g"].get("adv_kl_20steps")

@@ -22,7 +22,7 @@ import numpy as np
 import torch
 
 from posthoc_ci import constants, paths, swap_lib
-from posthoc_ci.controls import shuffled_b
+from posthoc_ci.controls import shuffled_fit
 
 N_BOOT = 1000
 ROWS = ("unmasked", "ci", "rounded_store", "rounded_01", "rounded_05", "zero")
@@ -60,7 +60,8 @@ def cond_arm(cond: str) -> str | None:
     return cond
 
 
-def _condition_ci(run, ci_true, b, cond):
+def _condition_ci(run, ci_true, fit, cond):
+    b, bias = fit if fit is not None else (None, None)
     if cond == "g":
         return swap_lib.ghat_dict(run, ci_true, b, identity=True)[0]
     if cond == "binarized":
@@ -69,7 +70,9 @@ def _condition_ci(run, ci_true, b, cond):
         return swap_lib.ghat_dict(run, ci_true, b, covering=True)[0]
     arm = cond_arm(cond)
     assert arm is not None
-    return swap_lib.ghat_dict(run, ci_true, b, **swap_lib.arm_solver_params(arm))[0]
+    return swap_lib.ghat_dict(
+        run, ci_true, b, bias=bias, **swap_lib.arm_solver_params(arm)
+    )[0]
 
 
 def _bootstrap_ci(per_seq: np.ndarray, seed: int = 0) -> tuple[float, float]:
@@ -95,12 +98,13 @@ def main() -> None:
         arm = cond_arm(cond)
         if arm is None:
             return None
-        b = torch.from_numpy(
-            np.load(paths.fit_dir(args.k, args.seed, arm) / "final.npz")["B"]
-        ).to(run.device)
+        b, bias = swap_lib.load_fit(paths.fit_dir(args.k, args.seed, arm), run.device)
         if cond.startswith("shuffled"):
-            b = shuffled_b(b.cpu(), args.seed).to(run.device)
-        return b
+            b, bias = shuffled_fit(b.cpu(), bias.cpu() if bias is not None else None,
+                                   args.seed)
+            b = b.to(run.device)
+            bias = bias.to(run.device) if bias is not None else None
+        return b, bias
 
     b_by_cond = {c: load_b(c) for c in conditions}
     n_seqs = run.tokens.shape[0]

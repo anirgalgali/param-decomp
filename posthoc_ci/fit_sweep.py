@@ -23,7 +23,19 @@ from posthoc_ci.figstyle import SERIES, apply_style, save
 from posthoc_ci.nmf import FitConfig, HeldOutMetrics, evaluate_b, fit_b
 
 
-def _arm_name(w_fn: float, signed_b: bool = False, signed_z: bool = False) -> str:
+def _arm_name(
+    w_fn: float,
+    signed_b: bool = False,
+    signed_z: bool = False,
+    rectified: bool = False,
+    warm: bool = False,
+) -> str:
+    if rectified:
+        assert not signed_b and not signed_z
+        base = "rect-warm" if warm else "rect"
+        if w_fn != 1.0:
+            base += f"-asym{w_fn:g}"
+        return base
     if signed_z:
         assert signed_b, "signed z without signed B is not a studied arm"
         base = "sgnBZ"
@@ -51,21 +63,51 @@ def fit_one(
     epochs: int,
     signed_b: bool = False,
     signed_z: bool = False,
+    rectified: bool = False,
+    init_from: str | None = None,
+    freeze_b_epochs: int = 1,
 ) -> None:
     device = "cuda"
     torch.manual_seed(seed)
-    arm = _arm_name(w_fn, signed_b, signed_z)
+    arm = _arm_name(w_fn, signed_b, signed_z, rectified, warm=init_from is not None)
     cfg = FitConfig(
         k=k, seed=seed, w_fn=w_fn, epochs=epochs, no_clip=no_clip,
         signed_b=signed_b, signed_z=signed_z,
+        rectified=rectified, freeze_b_epochs=freeze_b_epochs,
     )
     out_dir = paths.fit_dir(k, seed, arm)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    g_sample = next(_batches("train", device, seed=seed)())
-    b = fit_b(cfg, _batches("train", device, seed=seed), g_sample)
-
     per_atom_mean = torch.from_numpy(glib.per_atom_mean("train")).to(device)
+    b_init = None
+    if init_from is not None:
+        b_init = torch.from_numpy(
+            np.load(paths.fit_dir(k, seed, init_from) / "final.npz")["B"]
+        ).to(device)
+        if rectified:
+            # §3.2 warm anchor: the rectified path with b=0 must reproduce the
+            # init arm's row exactly — the Rung-1R nested-family identity test.
+            anchor = evaluate_b(
+                b_init, _batches("held", device)(), per_atom_mean,
+                constants.TAU_STORE, constants.TAU_EVAL, constants.CODE_L0_EPSILONS,
+                constants.Z_SOLVER_N_STEPS, w_fn=1.0,
+                bias=torch.zeros(b_init.shape[0], device=device),
+            )
+            ref = json.loads(
+                (paths.fit_dir(k, seed, init_from) / "metrics.json").read_text()
+            )
+            drift = abs(anchor.ev - ref["ev"])
+            (out_dir / "warm_anchor.json").write_text(json.dumps(
+                {"anchor": vars(anchor), "reference": {m: ref[m] for m in
+                 ("ev", "recall_weighted", "induced_l0_ratio")}, "ev_drift": drift},
+                indent=2, default=float))
+            assert drift < 0.01, f"warm anchor drifted from {init_from}: ΔEV={drift}"
+            print(f"warm anchor OK: EV {anchor.ev:.4f} vs {ref['ev']:.4f} (b=0 == {init_from})")
+
+    g_sample = next(_batches("train", device, seed=seed)())
+    b, bias = fit_b(cfg, _batches("train", device, seed=seed), g_sample, b_init=b_init)
+
+    dust_out: dict = {}
     metrics = evaluate_b(
         b,
         _batches("held", device)(),
@@ -76,11 +118,19 @@ def fit_one(
         constants.Z_SOLVER_N_STEPS,
         w_fn=w_fn,
         signed_z=signed_z,
+        bias=bias,
+        dust_out=dust_out if rectified else None,
     )
-    np.savez_compressed(out_dir / "final.npz", B=b.cpu().numpy().astype(np.float32))
+    arrays = {"B": b.cpu().numpy().astype(np.float32)}
+    if bias is not None:
+        arrays["b"] = bias.cpu().numpy().astype(np.float32)
+    np.savez_compressed(out_dir / "final.npz", **arrays)
+    if dust_out:
+        np.savez_compressed(out_dir / "dust.npz", **dust_out)
     record = {
         "k": k, "seed": seed, "arm": arm, "no_clip": no_clip,
-        "signed_b": signed_b, "signed_z": signed_z, **vars(metrics),
+        "signed_b": signed_b, "signed_z": signed_z, "rectified": rectified,
+        **vars(metrics),
     }
     (out_dir / "metrics.json").write_text(json.dumps(record, indent=2))
     print(json.dumps(record, indent=2))
@@ -200,6 +250,10 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=4)
     parser.add_argument("--signed-b", action="store_true")
     parser.add_argument("--signed-z", action="store_true")
+    parser.add_argument("--rectified", action="store_true")
+    parser.add_argument("--init-from", default=None,
+                        help="arm name whose fit at (k, seed) seeds B (warm arm)")
+    parser.add_argument("--freeze-b-epochs", type=int, default=1)
     parser.add_argument("--aggregate", action="store_true")
     args = parser.parse_args()
 
@@ -208,7 +262,8 @@ def main() -> None:
     else:
         assert args.k is not None, "--k required unless --aggregate"
         fit_one(args.k, args.seed, args.w_fn, args.no_clip, args.epochs,
-                args.signed_b, args.signed_z)
+                args.signed_b, args.signed_z, args.rectified, args.init_from,
+                args.freeze_b_epochs)
 
 
 if __name__ == "__main__":

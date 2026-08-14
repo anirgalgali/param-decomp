@@ -29,10 +29,8 @@ def main() -> None:
     args = parser.parse_args()
 
     run: EvalRun = swap_lib.load_eval_run(args.run_dir)
-    w_fn = 1.0 if args.arm == "sym" else float(args.arm.removeprefix("asym"))
-    b = torch.from_numpy(
-        np.load(paths.fit_dir(args.k, args.seed, args.arm) / "final.npz")["B"]
-    ).to(run.device)
+    solver_params = swap_lib.arm_solver_params(args.arm)
+    b, bias = swap_lib.load_fit(paths.fit_dir(args.k, args.seed, args.arm), run.device)
 
     acc = {
         "l0_g_store": 0.0, "l0_g_eval": 0.0, "l0_gh_store": 0.0, "l0_gh_eval": 0.0,
@@ -44,7 +42,7 @@ def main() -> None:
     for i, mb in enumerate(swap_lib.micro_slices()):
         tokens_mb = run.tokens[mb]
         ci = swap_lib.true_ci(run, tokens_mb)
-        gh, stats = swap_lib.ghat_dict(run, ci, b, w_fn=w_fn)
+        gh, stats = swap_lib.ghat_dict(run, ci, b, bias=bias, **solver_params)
 
         g_flat = swap_lib.ci_dict_to_flat(run, ci)
         gh_flat = swap_lib.ci_dict_to_flat(run, gh)

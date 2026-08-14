@@ -53,7 +53,8 @@ def member_pairs(b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _codes_topk(
-    b: torch.Tensor, device: str, signed_z: bool = False, code_sign: int = 1
+    b: torch.Tensor, device: str, signed_z: bool = False, code_sign: int = 1,
+    bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, np.ndarray, torch.Tensor, torch.Tensor]:
     """One streaming pass: per-latent top-30 by z, firing density, and per-(latent,
     member) conditioned top-8 — positions maximizing z_k among those where the member
@@ -72,7 +73,7 @@ def _codes_topk(
     rows_per_shard = constants.HARVEST_SHARD_POSITIONS
     for shard_idx, csr in glib.iter_shards("all"):
         g = torch.from_numpy(csr.toarray()).to(device)
-        z = solve_codes(g, b, constants.Z_SOLVER_N_STEPS, signed_z=signed_z)
+        z = solve_codes(g, b, constants.Z_SOLVER_N_STEPS, signed_z=signed_z, bias=bias)
         pos0 = shard_idx * rows_per_shard
         top_vals, top_pos = _merge_topk(top_vals, top_pos, code_sign * z, pos0)
         scores = z[:, pair_latent].abs() * (g[:, pair_atom] > constants.TAU_EVAL)
@@ -121,7 +122,9 @@ def main() -> None:
     from transformers import AutoTokenizer
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    b = torch.from_numpy(np.load(paths.fit_dir(args.k, args.seed, args.arm) / "final.npz")["B"]).to(device)
+    from posthoc_ci.swap_lib import load_fit
+
+    b, fit_bias = load_fit(paths.fit_dir(args.k, args.seed, args.arm), device)
     atom_df = glib.load_atom_index()
     alive = atom_df[atom_df.alive].reset_index(drop=True)
     token_meta = glib.load_token_meta()
@@ -140,7 +143,7 @@ def main() -> None:
     signed_z = arm_solver_params(args.arm)["signed_z"]
     code_sign = 1 if args.code_sign == "pos" else -1
     top_vals, top_pos, density, cond_vals, cond_pos = _codes_topk(
-        b, device, signed_z=signed_z, code_sign=code_sign
+        b, device, signed_z=signed_z, code_sign=code_sign, bias=fit_bias
     )
     pair_latent, pair_atom = member_pairs(b)
     b_row_sums = b.abs().sum(dim=1).cpu().numpy()  # atom's total |mass| across latents

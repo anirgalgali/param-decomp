@@ -35,9 +35,7 @@ def main() -> None:
 
     run = swap_lib.load_eval_run(args.run_dir)
     solver_params = swap_lib.arm_solver_params(args.arm)
-    b = torch.from_numpy(
-        np.load(paths.fit_dir(args.k, args.seed, args.arm) / "final.npz")["B"]
-    ).to(run.device)
+    b, bias = swap_lib.load_fit(paths.fit_dir(args.k, args.seed, args.arm), run.device)
 
     n_seqs, seq_len = run.tokens.shape
     draws_total = args.n_draws * len(constants.SEEDS)
@@ -51,7 +49,7 @@ def main() -> None:
     for i, mb in enumerate(swap_lib.micro_slices()):
         tokens_mb = run.tokens[mb]
         ci_true = swap_lib.true_ci(run, tokens_mb)
-        gh, _ = swap_lib.ghat_dict(run, ci_true, b, **solver_params)
+        gh, _ = swap_lib.ghat_dict(run, ci_true, b, bias=bias, **solver_params)
         tgt = swap_lib.target_logits(run, tokens_mb)
         lu = swap_lib.masked_forward(run, tokens_mb, ci_true, "unmasked")
         klu = swap_lib.per_position_kl(lu, tgt)
@@ -95,6 +93,9 @@ def main() -> None:
     b_np = b.cpu().numpy()
     alive = glib.alive_cols()
     atom_df = glib.load_atom_index().set_index("atom_id")
+    dropped_all = (g_all > constants.TAU_EVAL) & (h_all < constants.TAU_EVAL)
+    collision_all = dropped_all & (h_all == 0)
+    collision_share = float(collision_all.sum() / max(dropped_all.sum(), 1))
     freq: dict[int, int] = {}
     worst_rows = []
     for t in worst:
@@ -140,6 +141,7 @@ def main() -> None:
             (per_tok_h.mean() - klu_sum / klu_n) / max(per_tok_g.mean() - klu_sum / klu_n, 1e-9)
         ),
         "mean_dropped_atoms_per_token": float(dropped_count.mean()),
+        "collision_share_of_drops": collision_share,
         "worst_tokens": worst_rows[:20],
         "dropped_atom_table": dropped_table,
     }
