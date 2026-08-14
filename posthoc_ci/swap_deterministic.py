@@ -52,10 +52,11 @@ def cond_arm(cond: str) -> str | None:
     """
     if cond == "g":
         return None
-    if cond.startswith("shuffled"):
-        rest = cond.removeprefix("shuffled").removeprefix("-")
+    if cond.startswith("shuffled") or cond.startswith("binarized"):
+        prefix = "shuffled" if cond.startswith("shuffled") else "binarized"
+        rest = cond.removeprefix(prefix).removeprefix("-")
         return rest or "sym"
-    if cond in ("binarized", "covering"):
+    if cond == "covering":
         return "sym"
     return cond
 
@@ -64,8 +65,11 @@ def _condition_ci(run, ci_true, fit, cond):
     b, bias = fit if fit is not None else (None, None)
     if cond == "g":
         return swap_lib.ghat_dict(run, ci_true, b, identity=True)[0]
-    if cond == "binarized":
-        return swap_lib.ghat_dict(run, ci_true, b, binarize_at=constants.TAU_EVAL)[0]
+    if cond.startswith("binarized"):
+        arm = cond_arm(cond)
+        return swap_lib.ghat_dict(run, ci_true, b, bias=bias,
+                                  binarize_at=constants.TAU_EVAL,
+                                  **swap_lib.arm_solver_params(arm))[0]
     if cond == "covering":
         return swap_lib.ghat_dict(run, ci_true, b, covering=True)[0]
     arm = cond_arm(cond)
