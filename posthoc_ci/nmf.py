@@ -54,8 +54,12 @@ def solve_codes(
     """
     lr = 1.0 / max(_spectral_norm_sq(b), 1e-8)
     col_sq = (b * b).sum(dim=0).clamp_min(1e-8)
-    target = g if bias is None else g + bias
-    z = (target @ b) / col_sq
+    # Init from g alone even when a hurdle is present: a (g + bias) matched filter
+    # would tell every token to reproduce the hurdle on ALL atoms (including the
+    # ~98% with g = 0 whose correct pre-clip score is anything BELOW b), inflating
+    # the init by bias @ B — catastrophic at real scale. Under-initialization is the
+    # benign direction: the straight-through gradient restores missed floors.
+    z = (g @ b) / col_sq
     if not signed_z:
         z = z.clamp_min_(0.0)
     y = z.clone()
